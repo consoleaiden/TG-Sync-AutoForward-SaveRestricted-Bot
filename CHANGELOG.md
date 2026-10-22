@@ -7,6 +7,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **按钮式菜单交互**（`bot/menu.py`）：`/start`、`/menu` 打开图形化主菜单，用按钮向导完成
+  「新建克隆 → 选源 → 选目标 → 选起点 → 选模式 → 确认」，以及「任务列表 / 进度详情 /
+  暂停 / 继续 / 删除 / 设置 / 帮助」。向导状态 15 分钟 TTL，命令式用法全部保留。
+- **克隆起点可选**：从头（最早 → 最新）、从指定消息 ID（含该条）、从指定时间（自动换算
+  消息 ID 边界）、继续上次进度。命令侧对应 `/sync <链接> --from-id N` 与
+  `/sync <链接> --from-time 2024-01-31[T12:30]`。
+- **进度记录**：`tasks` 表新增 `start_msg_id`、`start_date`、`total_count`、`done_count`、
+  `fail_count`、`skip_count`、`source_title`、`target_title`、`last_error`、`notify_chat_id`、
+  `notify_msg_id`、`created_by`、`finished_at`；每处理一个转发单元即落盘游标与计数。
+  进度消息原地编辑刷新（带进度条 / 百分比 / 速率 / 剩余时间），不刷屏。
+- **断点续传**：暂停、进程崩溃、容器重启后均从 `last_synced_msg_id` 严格继续，不重复不遗漏；
+  启动时自动续传被中断的任务，可用 `clone.auto_resume: false` 改为仅置为暂停。
+- `db/database.py` 自动迁移：比对 `PRAGMA table_info` 后 `ALTER TABLE ADD COLUMN` 补齐新列，
+  老库升级不丢数据、可重复执行。
+- `core/clone_plan.py`：时间解析、进度条渲染、耗时估算、**相册安全分批**等纯逻辑工具。
+- `docs/clone.md`：克隆功能说明（起点语义、进度字段、续传机制、FAQ）。
+
+### Changed
+- `core/syncer.py` 重写为**流式分批**处理（`clone.batch_size`，默认 200）：不再把整个频道的
+  消息一次性读进内存，几万条的大频道也能稳定跑；相册不会被切到两批；服务消息与空消息计入
+  `skip_count` 并推进游标，不会卡住；FloodWait 后自动从游标重试（最多 5 轮）。
+- `/sync` 与菜单共用同一条创建链路，因此命令方式也获得了进度消息与断点续传能力。
+- 目标总量改用服务端 `count`（`min_id` 过滤），进度百分比是真实值而非估算。
+
+### Added (continued)
 - MTProto 代理自动选优：每小时拉取 telegram-mtproto-proxy-list 的 `top40.json`（多镜像回退），
   在本机对每条代理做真实 FakeTLS 握手测速后选用最快可用代理，写入 `data/proxy.json`；
   代理失效或明显更优时自动切换（`switch_improve_ratio` 控制切换阈值）。

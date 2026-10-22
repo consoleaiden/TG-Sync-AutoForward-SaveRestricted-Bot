@@ -6,6 +6,11 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 
 ## Features
 
+- **Button Menu** — `/start` opens a guided, button-driven menu; no commands or arguments to memorise
+- **Channel Cloning** — Clone any channel/group (including forum topics) from the earliest message to the latest
+- **Selectable Start Point** — From the beginning, from a message ID, from a date/time, or resume the previous run
+- **Live Progress** — Progress bar, percentage, speed and ETA, refreshed in place on a single message
+- **Resumable** — Pause, crash or restart and it continues from the saved cursor with no duplicates or gaps
 - **Link Parsing** — Send a `t.me/...` link in private chat to trigger forwarding; supports public/private channels, groups, comments, and forum topics
 - **Historical Sync** — `/sync` pulls past messages with resumable progress tracking; restricted messages are automatically forwarded via Takeout inline
 - **Restricted Message Sync** — `/syncrestrictedmsg` re-exports only platform-restricted messages using Telegram's Takeout API
@@ -14,6 +19,8 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 - **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
 - **Hard-Block Filtering** — Automatically skips globally restricted content (`platform=all`); platform-specific restrictions are still forwarded
 - **Dual Mode** — Supports both `copy` (default) and `forward` transfer modes
+
+See [docs/clone.md](docs/clone.md) for the cloning guide (start points, progress fields, resume semantics, FAQ).
 
 ## Architecture
 
