@@ -13,6 +13,16 @@ from telethon import TelegramClient
 # 将项目根目录添加到导入路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.userbot_manager import UserBotManager
+from core.keepalive import install as install_keepalive
+from core.proxy_manager import (
+    build_telethon_proxy,
+    create_client,
+    load_state,
+    normalize_config,
+    run_refresh,
+    state_to_candidate,
+    verify_proxy_applied,
+)
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -21,6 +31,43 @@ def load_config(path: str = "config.yaml") -> dict:
         sys.exit(1)
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def cfg_keepalive(config: dict) -> float:
+    """读取心跳间隔配置（秒），未配置时用 20 秒。"""
+    proxy_cfg = normalize_config(config.get("proxy"))
+    return float(proxy_cfg.get("keepalive_seconds",
+                               proxy_cfg.get("keepalive", 20) or 20))
+
+
+async def resolve_proxy(config: dict):
+    """按 config.yaml 的 proxy 配置解析代理（登录阶段同样需要，否则无法连上 Telegram）。"""
+    cfg = normalize_config(config.get("proxy"))
+    mode = str(cfg.get("mode") or "off").lower()
+    if mode == "off":
+        return None
+
+    if mode == "manual":
+        m = cfg.get("manual") or {}
+        if not (m.get("server") and m.get("port") and m.get("secret")):
+            print("⚠️  proxy.mode=manual 但 manual 配置不完整，将使用直连")
+            return None
+        return build_telethon_proxy({
+            "server": str(m["server"]), "port": int(m["port"]),
+            "secret": str(m["secret"]),
+        })
+
+    state = load_state(cfg["state_file"])
+    if state is None:
+        print("🔄 尚未选出代理，先执行一轮代理选优（约 10-30 秒）...")
+        state = await run_refresh(cfg, progress=True)
+        if state is None:
+            print("⚠️  代理选优失败，将尝试直连（若本机无法直连 Telegram 则登录必然失败）")
+            return None
+    cand = state_to_candidate(state)
+    print(f"🌐 使用代理: {cand['server']}:{cand['port']} "
+          f"({cand.get('kind', '?')}, {cand.get('latency_ms', '?')}ms)")
+    return build_telethon_proxy(cand)
 
 
 async def interactive_login(phone: str):
@@ -41,9 +88,16 @@ async def interactive_login(phone: str):
     print("==================================================")
     print("提示：如果是首次登录，Telethon 将在下方提示你输入收到的验证码（以及2FA密码）。\n")
 
-    client = TelegramClient(session_path, api_id, api_hash)
+    proxy = await resolve_proxy(config)
+    if proxy is not None:
+        # 等待用户输入验证码期间连接处于空闲态，需要更短的心跳避免被代理掐断
+        install_keepalive(cfg_keepalive(config))
+
+    client = create_client(session_path, api_id, api_hash, proxy=proxy)
     try:
         await client.start(phone=phone)
+        if proxy is not None:
+            verify_proxy_applied(client, "登录客户端")
         me = await client.get_me()
         first_name = getattr(me, "first_name", "") or ""
         username = getattr(me, "username", "") or ""

@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 from telethon import TelegramClient, errors
 
+from .proxy_manager import create_client, verify_proxy_applied
+
 if TYPE_CHECKING:
     pass
 
@@ -17,8 +19,10 @@ logger = logging.getLogger("tg_forward_bot.userbot_manager")
 class UserBotManager:
     """管理多个 UserBot 实例，支持按顺序探测私有会话可访问性。"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, proxy: tuple | None = None):
+        """proxy: (connection 类, (host, port, secret)) 或 None（直连）。"""
         self.config = config
+        self.proxy = proxy
         self.api_id = config.get("api_id")
         self.api_hash = config.get("api_hash")
 
@@ -70,19 +74,18 @@ class UserBotManager:
 
             logger.info("正在启动 UserBot #%d [%s] (Session: %s)...",
                         idx + 1, phone, session_path)
-            client = TelegramClient(
-                session_path,
-                self.api_id,
-                self.api_hash,
-                connection_retries=10,
-                retry_delay=5,
-                timeout=30,
+            # 统一经 create_client 构造，代理参数由此注入（防止漏传导致直连）
+            client = create_client(
+                session_path, self.api_id, self.api_hash, proxy=self.proxy,
+                connection_retries=10, retry_delay=5, timeout=30,
             )
             # 记录手机号属性，方便调试与日志
             setattr(client, "_phone", phone)
             setattr(client, "_userbot_index", idx + 1)
 
             await client.start(phone=phone)
+            if self.proxy is not None:
+                verify_proxy_applied(client, "UserBot #%d [%s]" % (idx + 1, phone))
             me = await client.get_me()
             first_name = getattr(me, "first_name", "") or ""
             username = getattr(me, "username", "") or ""
