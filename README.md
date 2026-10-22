@@ -179,6 +179,9 @@ docker compose exec bot python scripts/backup_db.py --keep 14
 - 默认 WAL 模式：`docker stop`、升级重建、掉电都不会写坏库，已提交的进度自动回放；
 - 菜单「💾 备份数据库」一键快照到 `data/backups/`，默认保留最近 7 份；
 - 自定义位置用 `storage.db_path` 或 `TG_DB_PATH`，**记得同时加目录挂载**；
+- 升级若报 `container name "/tg-sync-bot" is already in use`：旧容器不是本 compose 项目建的，
+  `docker rm -f tg-sync-bot` 后重跑即可（数据在 `./data`，不受影响），步骤见
+  [docs/storage.md](docs/storage.md#常见问题)；
 - 完整说明（群晖映射、恢复步骤、迁移新机、常见报错）见 [docs/storage.md](docs/storage.md)。
 
 ## 无法直连 Telegram？MTProto 代理自动选优

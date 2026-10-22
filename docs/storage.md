@@ -147,6 +147,39 @@ cd /volume1/docker/tg-sync-bot && docker compose exec -T bot python scripts/back
 
 ## 常见问题
 
+**升级时 `docker compose up -d` 报 `container name "/tg-sync-bot" is already in use`**
+
+宿主机上已经有一个叫 `tg-sync-bot` 的容器，但它不是当前 compose 项目创建的（群晖 Container Manager
+手动建的、换过项目目录、或以前用 `docker run` 起的）。compose 只接管自己项目里的容器，于是想新建
+同名容器 → 名字冲突。**数据不受影响**，先确认旧容器的数据挂在哪（只查不改）：
+
+```bash
+docker inspect tg-sync-bot --format '{{.State.Status}}'
+docker inspect tg-sync-bot --format '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+```
+
+- 若 `/app/data`、`/app/sessions` 显示为 `bind` 且 `Source` 是宿主机目录（如
+  `/volume2/docker/TG-Sync-Bot/data`）→ 数据在宿主机，删容器是安全的：
+
+  ```bash
+  # 保险：先把库和会话拷一份出来（旧镜像可能还没有 backup_db.py）
+  mkdir -p /volume2/docker/TG-Sync-Bot/_bak
+  docker cp tg-sync-bot:/app/data/bot.db /volume2/docker/TG-Sync-Bot/_bak/bot.db.$(date +%F-%H%M)
+  docker rm -f tg-sync-bot
+  docker compose up -d
+  docker compose logs -f --tail=50     # 看到「已持久化」「沿用已有数据库」即可
+  ```
+
+- 若显示为 `volume`（没有宿主机真实路径）→ 数据还在旧容器的卷里，先导出再删：
+
+  ```bash
+  docker cp tg-sync-bot:/app/data/. ./data/
+  docker cp tg-sync-bot:/app/sessions/. ./sessions/
+  docker rm -f tg-sync-bot && docker compose up -d
+  ```
+
+之后固定在同一目录用 `docker compose` 升级；不要再在群晖 UI 里另建同名容器，否则下次还会撞名。
+
 **升级镜像后任务列表空了**
 
 先看启动日志里数据库路径：如果变成了容器内的临时路径，说明挂载丢了（群晖重建容器时最容易发生），

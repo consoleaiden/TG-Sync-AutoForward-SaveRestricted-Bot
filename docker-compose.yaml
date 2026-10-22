@@ -1,3 +1,7 @@
+# 固定 project 名：无论从哪个目录执行 docker compose，都归到同一个项目，
+# 避免「换个目录 up 就报 container name already in use」
+name: tg-sync-bot
+
 services:
   bot:
     # 使用 CI 构建的官方镜像（docker compose up -d 时自动拉取）
