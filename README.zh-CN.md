@@ -125,6 +125,27 @@ docker compose up -d --build
 | `./data`        | `/app/data`        |
 | `./sessions`    | `/app/sessions`    |
 
+## 无法直连 Telegram？MTProto 代理自动选优
+
+网络无法直连 Telegram（如国内群晖 NAS）时，可开启内置的代理自动选优：每小时从
+[telegram-mtproto-proxy-list](https://github.com/consoleaiden/telegram-mtproto-proxy-list)
+拉取 `top40.json`，**在本机对每条代理做真实 FakeTLS 握手测速**，自动选用本机最快的可用代理，
+代理失效或明显更优时自动切换。
+
+```yaml
+# config.yaml
+proxy:
+  mode: auto            # off（默认直连）/ auto / manual
+  refresh_minutes: 60
+```
+
+```bash
+# 排查用：看本机实测榜单
+docker compose run --rm bot python -m core.proxy_manager --test
+```
+
+完整说明（原理、参数、群晖部署、排障）见 [docs/proxy-auto.md](./docs/proxy-auto.md)。
+
 ## 注意事项
 
 - **受限消息由 UserBot 身份发出**：Takeout 获取的媒体引用绑定 UserBot，Bot 无法直接使用.
