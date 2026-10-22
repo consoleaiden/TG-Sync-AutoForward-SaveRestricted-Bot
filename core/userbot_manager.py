@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from typing import TYPE_CHECKING
 
 from telethon import TelegramClient, errors
@@ -14,6 +15,14 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger("tg_forward_bot.userbot_manager")
+
+
+class UserBotNotAuthorized(RuntimeError):
+    """UserBot 没有可用会话，且当前环境无法完成交互式登录。
+
+    容器里 stdin 不是终端，``client.start()`` 会调用 ``input()`` 拿验证码，
+    结果只能抛 ``EOFError`` 堆栈。这里转成带修复步骤的明确错误。
+    """
 
 
 class UserBotManager:
@@ -56,6 +65,18 @@ class UserBotManager:
         # 否则使用基于手机号命名的独立 session 文件
         return f"sessions/userbot_{clean_phone}"
 
+    @staticmethod
+    def login_hint(phone: str, session_path: str) -> str:
+        """生成「如何完成首次登录」的可执行提示。"""
+        return (
+            f"UserBot [{phone}] 尚未登录：找不到有效会话 {session_path}.session，"
+            f"而当前环境没有可交互终端，无法输入登录验证码。\n"
+            f"请在宿主机（NAS）的项目目录下执行一次登录（-it 必须保留，否则无法输入验证码）：\n"
+            f"    docker compose run --rm -it bot python scripts/login_userbot.py -p {phone}\n"
+            f"登录成功后会话会写入 {session_path}.session（sessions/ 已挂载到宿主机），"
+            f"容器重启后会自动恢复。"
+        )
+
     async def start(self) -> None:
         """按顺序初始化并启动所有配置的 UserBot。"""
         if not self.phones:
@@ -83,7 +104,21 @@ class UserBotManager:
             setattr(client, "_phone", phone)
             setattr(client, "_userbot_index", idx + 1)
 
-            await client.start(phone=phone)
+            # 未授权会话 + 无终端：直接给出修复指引，不要让 input() 抛 EOFError 堆栈
+            if client.session.auth_key is None and not sys.stdin.isatty():
+                raise UserBotNotAuthorized(self.login_hint(phone, session_path))
+
+            try:
+                await client.start(phone=phone)
+            except EOFError as e:
+                raise UserBotNotAuthorized(self.login_hint(phone, session_path)) from e
+            except errors.AuthKeyUnregisteredError as e:
+                raise UserBotNotAuthorized(
+                    f"UserBot [{phone}] 的登录会话已失效（可能在该账号的「设备」里被退出，"
+                    f"或服务器侧已吊销授权）。\n"
+                    f"请删除 sessions/{os.path.basename(session_path)}.session 后重新登录：\n"
+                    f"    docker compose run --rm -it bot python scripts/login_userbot.py -p {phone}"
+                ) from e
             if self.proxy is not None:
                 verify_proxy_applied(client, "UserBot #%d [%s]" % (idx + 1, phone))
             me = await client.get_me()

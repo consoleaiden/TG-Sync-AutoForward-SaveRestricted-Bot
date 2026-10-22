@@ -51,10 +51,11 @@ logger = logging.getLogger("tg_forward_bot.proxy_manager")
 
 REPO = "consoleaiden/telegram-mtproto-proxy-list"
 
-# top40.json 镜像源：依次尝试，直到成功。国内网络推荐把可达的镜像排前面。
+# top40.json 镜像源：依次尝试，直到成功。
+# fastly 放首位：实测 cdn.jsdelivr.net 在国内网络常被 reset（Errno 104）。
 DEFAULT_SOURCES = [
-    "https://cdn.jsdelivr.net/gh/%s@main/top40.json" % REPO,
     "https://fastly.jsdelivr.net/gh/%s@main/top40.json" % REPO,
+    "https://cdn.jsdelivr.net/gh/%s@main/top40.json" % REPO,
     "https://gcore.jsdelivr.net/gh/%s@main/top40.json" % REPO,
     "https://raw.githubusercontent.com/%s/main/top40.json" % REPO,
     "https://gh-proxy.com/raw.githubusercontent.com/%s/main/top40.json" % REPO,
@@ -478,10 +479,18 @@ def create_client(session, api_id, api_hash, *, proxy=None, **kwargs):
     from telethon import TelegramClient
 
     kwargs.update(build_client_kwargs(proxy))
-    client = TelegramClient(session, api_id, api_hash, **kwargs)
+    if proxy is None:
+        return TelegramClient(session, api_id, api_hash, **kwargs)
 
-    if proxy is not None:
-        verify_proxy_applied(client, "TelegramClient(%s)" % session)
+    # MTProxy 由 connection 类自身实现（不使用 python-socks），但 Telethon 对任何
+    # proxy 参数都会告警「proxy argument will be ignored」，容易在排障时误导。
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=".*proxy argument will be ignored.*")
+        client = TelegramClient(session, api_id, api_hash, **kwargs)
+
+    verify_proxy_applied(client, "TelegramClient(%s)" % session)
     return client
 
 

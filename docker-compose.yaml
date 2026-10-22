@@ -6,6 +6,9 @@ services:
     # build: .
     container_name: tg-sync-bot
     restart: unless-stopped
+    environment:
+      # 日志时间与宿主机对齐（镜像内已装 tzdata）
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

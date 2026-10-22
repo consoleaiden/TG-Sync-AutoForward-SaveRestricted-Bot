@@ -134,7 +134,7 @@ sessions/          # UserBot 登录后生成
 
 ```bash
 cd /volume1/docker/tg-forward-bot
-sudo docker compose run --rm bot python scripts/login_userbot.py -p +8613800000000
+sudo docker compose run --rm -it bot python scripts/login_userbot.py -p +8613800000000
 # 输入收到的验证码；若开启了两步验证，再输入 2FA 密码
 ```
 

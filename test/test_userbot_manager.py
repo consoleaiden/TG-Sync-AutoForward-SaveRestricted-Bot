@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from telethon import errors
-from core.userbot_manager import UserBotManager
+from core.userbot_manager import UserBotManager, UserBotNotAuthorized
 
 
 class TestUserBotManager(unittest.IsolatedAsyncioTestCase):
@@ -108,3 +108,45 @@ class TestUserBotManager(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUserBotLoginGuard(unittest.IsolatedAsyncioTestCase):
+    """容器内无终端时，未登录的 UserBot 应给出可执行的修复指引而不是 EOFError 堆栈。"""
+
+    def _fake_client(self, auth_key):
+        client = MagicMock()
+        client.session.auth_key = auth_key
+        client.start = AsyncMock(side_effect=EOFError("EOF when reading a line"))
+        client.disconnect = AsyncMock()
+        return client
+
+    async def test_missing_session_without_tty_explains_how_to_login(self):
+        mgr = UserBotManager({"phones": ["+8613800138001"],
+                              "api_id": 1, "api_hash": "x"})
+        fake = self._fake_client(auth_key=None)
+
+        with patch("core.userbot_manager.create_client", return_value=fake), \
+                patch("core.userbot_manager.sys.stdin") as stdin:
+            stdin.isatty.return_value = False
+            with self.assertRaises(UserBotNotAuthorized) as ctx:
+                await mgr.start()
+
+        msg = str(ctx.exception)
+        self.assertIn("docker compose run --rm -it", msg)
+        self.assertIn("+8613800138001", msg)
+        self.assertIn("sessions/userbot_8613800138001", msg)
+        # 没终端就不该尝试交互式登录
+        fake.start.assert_not_awaited()
+
+    async def test_eof_error_converted_to_hint(self):
+        mgr = UserBotManager({"phones": ["+8613800138001"],
+                              "api_id": 1, "api_hash": "x"})
+        fake = self._fake_client(auth_key=b"has-key")
+
+        with patch("core.userbot_manager.create_client", return_value=fake), \
+                patch("core.userbot_manager.sys.stdin") as stdin:
+            stdin.isatty.return_value = True
+            with self.assertRaises(UserBotNotAuthorized) as ctx:
+                await mgr.start()
+
+        self.assertIn("docker compose run --rm -it", str(ctx.exception))

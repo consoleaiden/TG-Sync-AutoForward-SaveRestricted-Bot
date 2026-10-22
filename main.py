@@ -10,7 +10,7 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from db.database import Database
 from bot.handlers import register_handlers
 from core.monitor import MonitorManager
-from core.userbot_manager import UserBotManager
+from core.userbot_manager import UserBotManager, UserBotNotAuthorized
 from core.keepalive import install as install_keepalive
 from core.proxy_manager import (
     load_state,
@@ -296,7 +296,14 @@ async def main():
     userbot_manager = UserBotManager(config, proxy=proxy)
 
     # === 首次启动 ===
-    await _start_clients(bot, userbot_manager, config)
+    try:
+        await _start_clients(bot, userbot_manager, config)
+    except UserBotNotAuthorized as e:
+        # 这是配置/部署问题，不是程序缺陷：打印可执行的修复步骤后退出，
+        # 完成登录后容器重启即可自动恢复。
+        logger.critical("%s", e)
+        logger.critical("进程退出（退出码 78），修复后 Docker 会自动重启并恢复运行")
+        sys.exit(78)
     await _setup_bot(bot, userbot_manager, db, config)
 
     # === 每小时代理复测（auto 模式）===

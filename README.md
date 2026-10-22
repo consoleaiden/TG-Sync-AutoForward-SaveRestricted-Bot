@@ -62,7 +62,7 @@ cp config.example.yaml config.yaml   # 编辑填入你的配置 (api_id, api_has
   ```
 * **Docker 交互运行**：
   ```bash
-  docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
+  docker compose run --rm -it bot python scripts/login_userbot.py -p +8613800138000
   ```
 
 > **说明**：
@@ -128,7 +128,7 @@ cp config.example.yaml config.yaml
 #    编辑 config.yaml 填入 api_id / api_hash / bot_token 等
 
 # 2. 首次交互式初始化 UserBot 登录
-docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
+docker compose run --rm -it bot python scripts/login_userbot.py -p +8613800138000
 
 # 3. 启动（自动拉取镜像）
 docker compose up -d
@@ -200,3 +200,13 @@ docker compose run --rm bot python -m core.proxy_manager --test
 | `tg_forward_bot.monitor`           | 实时监控事件               |
 
 详细运维文档见 [`docs/operations.md`](docs/operations.md) 与 [`docs/architecture.md`](docs/architecture.md)。
+
+### 常见启动失败
+
+| 日志现象                                                            | 原因与处理                                                                                                                              |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `EOFError: EOF when reading a line` + `code_callback` 栈            | UserBot 没有可用会话，容器内无法输入验证码。执行 `docker compose run --rm -it bot python scripts/login_userbot.py -p <手机号>` 完成登录 |
+| `UserBot [...] 尚未登录` / `登录会话已失效`                         | 同上；会话失效时先删除 `sessions/userbot_<手机号>.session` 再重新登录                                                                   |
+| `proxy argument will be ignored because python-socks is not installed` | 仅提示信息，MTProxy 走连接类自身实现，代理仍然生效，可忽略                                                                              |
+| `镜像拉取失败 ... Connection reset by peer`                         | 代理列表镜像被重置，会自动换下一个镜像；把可达镜像放 `DEFAULT_SOURCES` 首位即可减少等待                                                 |
+| 容器日志时间比宿主机慢 8 小时                                       | 容器内为 UTC。`docker-compose.yaml` 已设 `TZ=Asia/Shanghai`，旧镜像需重新拉取                                                           |
