@@ -66,6 +66,10 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "### 已发布镜像" >> $GITHUB_STEP_SUMMARY
-          for t in ${{ steps.meta.outputs.tags }}; do echo "- \`$t\`" >> $GITHUB_STEP_SUMMARY; done
+          echo "### 已发布镜像" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$TAGS" | sed '/^$/d' | while read -r t; do
+            echo "- \`$t\`" >> "$GITHUB_STEP_SUMMARY"
+          done
