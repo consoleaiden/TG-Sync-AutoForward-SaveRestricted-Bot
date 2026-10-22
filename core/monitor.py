@@ -1,6 +1,7 @@
 """实时监控：监听源的新消息并转发到目标。"""
 import asyncio
 import logging
+import os
 
 from telethon import TelegramClient, events, errors
 from telethon.tl.types import MessageService
@@ -12,6 +13,9 @@ from db import models
 
 logger = logging.getLogger("tg_forward_bot.monitor")
 
+# 监控任务每收到一条消息就写库代价偏高，先在内存累加，按此间隔批量落盘
+STATS_FLUSH_SECONDS = float(os.getenv("MONITOR_STATS_FLUSH_SECONDS", "5"))
+
 
 class MonitorManager(ForwardingComponent):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
@@ -20,6 +24,77 @@ class MonitorManager(ForwardingComponent):
         super().__init__(bot, userbot, db, config, userbot_manager=userbot_manager)
         self._handlers: dict[int, tuple[callable, TelegramClient]] = {}
         self._album_buffers: dict[tuple[int, int], dict] = {}
+        # 监控任务的内存计数：done/fail/skip/last_msg_id/last_error
+        self._stats: dict[int, dict] = {}
+        self._stats_tasks: dict[int, asyncio.Task] = {}
+
+    # ------------------------------------------------------------------
+    # 进度统计
+    # ------------------------------------------------------------------
+
+    def _stats_of(self, task_id: int) -> dict:
+        return self._stats.setdefault(task_id, {
+            "done": 0, "fail": 0, "skip": 0,
+            "last_msg_id": 0, "last_error": None,
+        })
+
+    def bump_stats(self, task_id: int, *, done: int = 0, fail: int = 0,
+                   skip: int = 0, msg_id: int | None = None,
+                   error: str | None = None) -> None:
+        """累加监控进度（内存），由定时任务批量写库。"""
+        s = self._stats_of(task_id)
+        s["done"] += done
+        s["fail"] += fail
+        s["skip"] += skip
+        if msg_id and msg_id > s["last_msg_id"]:
+            s["last_msg_id"] = int(msg_id)
+        if error:
+            s["last_error"] = str(error)[:200]
+
+    async def flush_stats(self, task_id: int) -> None:
+        """把内存计数落盘；失败时保留计数，下个周期重试。"""
+        s = self._stats.get(task_id)
+        if not s:
+            return
+        done, fail, skip = s["done"], s["fail"], s["skip"]
+        last_id, err = s["last_msg_id"], s["last_error"]
+        if not (done or fail or skip or last_id or err):
+            return
+        try:
+            await models.update_progress(
+                self.db, task_id,
+                last_msg_id=last_id or None,
+                done_delta=done, fail_delta=fail, skip_delta=skip,
+                last_error=err)
+        except Exception as e:
+            logger.debug("监控 #%s 进度写库失败: %s", task_id, e)
+            return
+        s["done"] = s["fail"] = s["skip"] = 0
+        s["last_error"] = None
+
+    async def _stats_loop(self, task_id: int) -> None:
+        try:
+            while True:
+                await asyncio.sleep(STATS_FLUSH_SECONDS)
+                await self.flush_stats(task_id)
+        except asyncio.CancelledError:
+            return
+
+    async def get_live_stats(self, task_id: int) -> dict:
+        """返回任务最新计数（内存未落盘部分 + 库内已落盘部分）。"""
+        await self.flush_stats(task_id)
+        task = await models.get_task(self.db, task_id) or {}
+        return {
+            "done": int(task.get("done_count") or 0),
+            "fail": int(task.get("fail_count") or 0),
+            "skip": int(task.get("skip_count") or 0),
+            "last_msg_id": int(task.get("last_synced_msg_id") or 0),
+            "last_error": task.get("last_error"),
+            "updated_at": task.get("updated_at"),
+        }
+
+    def is_running(self, task_id: int) -> bool:
+        return task_id in self._handlers
 
     def _new_album_buffer(self, source_chat_id: int, target_chat_id: int,
                           mode: str, target_topic_id: int | None,
@@ -66,12 +141,14 @@ class MonitorManager(ForwardingComponent):
     async def _forward_and_save(self, task_id: int, source_chat_id: int, source_msg_id: int,
                                 target_chat_id: int, mode: str,
                                 target_topic_id: int | None,
-                                userbot: TelegramClient | None = None):
+                                userbot: TelegramClient | None = None) -> bool:
         target_msg_id = await self.forwarder.forward_message(
             source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id,
             caller="monitor", userbot=userbot)
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
+            return True
+        return False
 
     async def _flush_album(self, task_id: int, grouped_id: int):
         key = (task_id, grouped_id)
@@ -102,6 +179,7 @@ class MonitorManager(ForwardingComponent):
                 reason=f"受限: {restricted_field}",
                 userbot=ub,
             )
+            self.bump_stats(task_id, skip=len(msg_ids), msg_id=msg_ids[-1])
             return
 
         logger.info("监控 #%s 聚合相册 grouped_id=%s 条数=%s",
@@ -109,8 +187,13 @@ class MonitorManager(ForwardingComponent):
         target_msg_ids = await self.forwarder.forward_album(
             source_chat_id, msg_ids, target_chat_id, mode, target_topic_id,
             caller="monitor", userbot=ub)
+        ok = 0
         for src_id, tgt_id in zip(msg_ids, target_msg_ids):
-            await models.save_message_map(self.db, task_id, src_id, tgt_id)
+            if tgt_id:
+                await models.save_message_map(self.db, task_id, src_id, tgt_id)
+                ok += 1
+        self.bump_stats(task_id, done=ok, fail=len(msg_ids) - ok,
+                        msg_id=msg_ids[-1])
 
     async def start_monitor(self, task_id: int, source_chat_id: int,
                             target_chat_id: int, mode: str = "copy",
@@ -147,6 +230,7 @@ class MonitorManager(ForwardingComponent):
                         reason=f"受限: {restricted_field}",
                         userbot=active_userbot,
                     )
+                    self.bump_stats(task_id, skip=1, msg_id=event.message.id)
                     return
 
                 grouped_id = getattr(event.message, "grouped_id", None)
@@ -170,18 +254,30 @@ class MonitorManager(ForwardingComponent):
                             await self._flush_album(task_id, grouped_id)
                         except asyncio.CancelledError:
                             return
+                        except Exception as e:
+                            logger.warning("监控 #%s 相册处理异常: %s", task_id, e)
+                            self.bump_stats(task_id, fail=1, error=str(e))
 
                     buffer["flush_task"] = asyncio.create_task(delayed_flush())
                     return
 
-                await self._forward_and_save(
+                ok = await self._forward_and_save(
                     task_id, source_chat_id, event.message.id,
                     target_chat_id, mode, target_topic_id,
                     userbot=active_userbot)
+                self.bump_stats(
+                    task_id, done=1 if ok else 0, fail=0 if ok else 1,
+                    msg_id=event.message.id,
+                    error=None if ok else "转发失败（详见容器日志）")
             except (errors.ChannelPrivateError, errors.ChatAdminRequiredError) as e:
                 logger.error("监控 #%s 源不可访问: %s，标记为失败", task_id, type(e).__name__)
+                self.bump_stats(task_id, fail=1, error=f"源不可访问: {type(e).__name__}")
+                await self.flush_stats(task_id)
                 await models.update_task_status(self.db, task_id, "failed")
                 self._handlers.pop(task_id, None)
+                stats_task = self._stats_tasks.pop(task_id, None)
+                if stats_task and not stats_task.done():
+                    stats_task.cancel()
                 active_userbot.remove_event_handler(handler)
                 try:
                     await self.bot.send_message(
@@ -192,10 +288,14 @@ class MonitorManager(ForwardingComponent):
                     pass
             except Exception as e:
                 logger.warning("监控 #%s 转发异常: %s", task_id, e)
+                self.bump_stats(task_id, fail=1, msg_id=event.message.id,
+                                error=f"{type(e).__name__}: {e}")
 
         active_userbot.add_event_handler(
             handler, events.NewMessage(chats=source_chat_id))
         self._handlers[task_id] = (handler, active_userbot)
+        # 单个任务一个落盘协程，避免每条消息都写库
+        self._stats_tasks[task_id] = asyncio.create_task(self._stats_loop(task_id))
         phone = getattr(active_userbot, "_phone", "default")
         logger.info("监控任务 #%s 已注册在 UserBot [%s]: source=%s topic=%s",
                     task_id, phone, source_chat_id, source_topic_id)
@@ -205,6 +305,10 @@ class MonitorManager(ForwardingComponent):
         if entry:
             handler, client = entry
             client.remove_event_handler(handler)
+        stats_task = self._stats_tasks.pop(task_id, None)
+        if stats_task and not stats_task.done():
+            stats_task.cancel()
+        await self.flush_stats(task_id)
         keys = [k for k in self._album_buffers if k[0] == task_id]
         for key in keys:
             buf = self._album_buffers.pop(key, None)

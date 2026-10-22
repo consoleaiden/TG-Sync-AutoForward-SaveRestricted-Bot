@@ -167,6 +167,40 @@ async def find_resumable_clone(db: Database, source_chat_id: int,
     return dict(row) if row else None
 
 
+async def find_monitor_task(db: Database, source_chat_id: int,
+                            target_chat_id: int,
+                            source_topic_id: int | None,
+                            target_topic_id: int | None,
+                            statuses: tuple[str, ...] = ("running", "paused")
+                            ) -> dict | None:
+    """查找同一「源话题 → 目标话题」下已存在的监控任务，用于防止重复添加。"""
+    placeholders = ",".join("?" for _ in statuses)
+    cursor = await db.db.execute(
+        f"""SELECT * FROM tasks
+            WHERE type='monitor'
+              AND source_chat_id=? AND target_chat_id=?
+              AND IFNULL(source_topic_id,0)=IFNULL(?,0)
+              AND IFNULL(target_topic_id,0)=IFNULL(?,0)
+              AND status IN ({placeholders})
+            ORDER BY id DESC LIMIT 1""",
+        (source_chat_id, target_chat_id, source_topic_id, target_topic_id,
+         *statuses),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_tasks_by_type(db: Database, task_type: str) -> list[dict]:
+    """按类型取全部任务（含已完成的），用于监控任务总览。"""
+    cursor = await db.db.execute(
+        """SELECT * FROM tasks WHERE type=?
+           AND status != 'deleted'
+           ORDER BY (status='running') DESC, id DESC""",
+        (task_type,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def save_message_map(db: Database, task_id: int,
                            source_msg_id: int, target_msg_id: int):
     await db.db.execute(

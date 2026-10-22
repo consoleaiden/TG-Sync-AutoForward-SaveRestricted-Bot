@@ -20,6 +20,7 @@ from core.clone_plan import (
     human_count,
     parse_start_time,
     progress_bar,
+    to_local_time,
 )
 from db import models
 
@@ -140,6 +141,7 @@ class MenuController:
             [Button.inline("📥 新建克隆任务", data="m:new:clone")],
             [Button.inline("👁 实时监控新消息", data="m:new:monitor")],
             [Button.inline("📋 我的任务与进度", data="m:tasks")],
+            [Button.inline("📡 监控任务（已配置）", data="m:monitors")],
             [Button.inline("⚙️ 限流设置", data="m:settings"),
              Button.inline("❓ 使用说明", data="m:help")],
         ]
@@ -298,6 +300,9 @@ class MenuController:
     def _pct_text(task: dict) -> str:
         total = int(task.get("total_count") or 0)
         done = int(task.get("done_count") or 0)
+        if task["type"] not in models.CLONE_TASK_TYPES:
+            # 监控任务没有总量，用已转发条数表示进度
+            return f"{done:,} 条" if done else "待转发"
         if total > 0:
             return f"{min(100, done * 100 // total)}%"
         return "—"
@@ -318,6 +323,78 @@ class MenuController:
                 buttons.append([Button.inline(label[:52], data=f"m:task:{t['id']}")])
             buttons.append([Button.inline("🔄 刷新", data="m:tasks"),
                             Button.inline("« 主菜单", data="m:home")])
+        if edit:
+            try:
+                await event.edit(text, buttons=buttons)
+                return
+            except Exception:
+                pass
+        await event.respond(text, buttons=buttons)
+
+    async def _monitor_stats(self, task: dict) -> dict:
+        """取监控任务进度：优先用运行时未落盘计数，失败则退回库内值。"""
+        out = {
+            "done": int(task.get("done_count") or 0),
+            "fail": int(task.get("fail_count") or 0),
+            "skip": int(task.get("skip_count") or 0),
+            "last_msg_id": int(task.get("last_synced_msg_id") or 0),
+            "last_error": task.get("last_error"),
+            "last_activity": to_local_time(task.get("updated_at")),
+        }
+        mm = getattr(self, "monitor_manager", None)
+        if mm is not None and hasattr(mm, "get_live_stats"):
+            try:
+                live = await mm.get_live_stats(task["id"])
+                for key in ("done", "fail", "skip", "last_msg_id", "last_error"):
+                    if live.get(key) is not None:
+                        out[key] = live[key]
+                if live.get("updated_at"):
+                    out["last_activity"] = to_local_time(live["updated_at"])
+            except Exception as e:
+                logger.debug("读取监控实时进度失败 #%s: %s", task["id"], e)
+        return out
+
+    async def render_monitors(self, event, edit: bool = True):
+        """实时监控任务总览：看得到设置了哪些监控、各自转发了多少。"""
+        tasks = [t for t in await models.get_all_active_tasks(self.db)
+                 if t["type"] == "monitor"]
+        if not tasks:
+            text = ("📡 还没有实时监控任务\n\n"
+                    "监控会把源频道的新消息实时转发到目标，"
+                    "创建后在这里能看到每个任务的源、目标与已转发条数。")
+            buttons = [[Button.inline("👁 新建实时监控", data="m:new:monitor")],
+                       [Button.inline("📥 新建克隆任务", data="m:new:clone")],
+                       [Button.inline("« 主菜单", data="m:home")]]
+        else:
+            running = sum(1 for t in tasks if t["status"] == "running")
+            lines = [f"📡 实时监控任务（共 {len(tasks)} 个，运行中 {running} 个）", ""]
+            for t in tasks[:10]:
+                stats = await self._monitor_stats(t)
+                status = STATUS_EMOJI.get(t["status"], "❓")
+                src = t.get("source_title") or str(t["source_chat_id"])
+                tgt = t.get("target_title") or str(t["target_chat_id"])
+                scope = f"话题 #{t['source_topic_id']}" if t.get("source_topic_id") else "全部消息"
+                lines.append(f"{status} #{t['id']} {src}（{scope}）")
+                lines.append(f"   → {tgt}")
+                lines.append(f"   已转发 {stats['done']:,} · 失败 {stats['fail']} · 跳过 {stats['skip']}")
+                if stats.get("last_msg_id"):
+                    lines.append(f"   最近消息 msg_id={stats['last_msg_id']}")
+                if stats.get("last_activity"):
+                    lines.append(f"   最近活动 {stats['last_activity']}")
+                if stats.get("last_error"):
+                    lines.append(f"   ⚠️ {str(stats['last_error'])[:60]}")
+                lines.append("")
+            buttons = []
+            for t in tasks[:10]:
+                status = STATUS_EMOJI.get(t["status"], "❓")
+                src = (t.get("source_title") or str(t["source_chat_id"]))[:24]
+                buttons.append([Button.inline(
+                    f"{status} #{t['id']} {src} {self._pct_text(t)}"[:52],
+                    data=f"m:task:{t['id']}")])
+            buttons.append([Button.inline("🔄 刷新", data="m:monitors"),
+                            Button.inline("👁 新建监控", data="m:new:monitor")])
+            buttons.append([Button.inline("« 主菜单", data="m:home")])
+            text = "\n".join(lines).rstrip()
         if edit:
             try:
                 await event.edit(text, buttons=buttons)
@@ -351,20 +428,33 @@ class MenuController:
             lines.append(f"起点: {start}")
             lines.append(f"进度: {progress_bar(done, total)}")
             lines.append(f"游标: msg_id={int(t.get('last_synced_msg_id') or 0)}")
-        lines.append(
-            f"成功 {done:,} · 失败 {int(t.get('fail_count') or 0):,}"
-            f" · 跳过 {int(t.get('skip_count') or 0):,}")
+            lines.append(
+                f"成功 {done:,} · 失败 {int(t.get('fail_count') or 0):,}"
+                f" · 跳过 {int(t.get('skip_count') or 0):,}")
+        else:
+            stats = await self._monitor_stats(t)
+            scope = (f"仅话题 #{t['source_topic_id']}"
+                     if t.get("source_topic_id") else "全部新消息")
+            lines.append(f"监听范围: {scope}")
+            lines.append(
+                f"已转发 {stats['done']:,} 条 · 失败 {stats['fail']} · 跳过 {stats['skip']}")
+            if stats.get("last_msg_id"):
+                lines.append(f"最近消息: msg_id={stats['last_msg_id']}")
+            if stats.get("last_activity"):
+                lines.append(f"最近活动: {stats['last_activity']}")
         if t.get("last_error"):
             lines.append(f"最近错误: {str(t['last_error'])[:80]}")
-        created = str(t.get("created_at") or "")[:16]
-        updated = str(t.get("updated_at") or "")[:16]
+        created = to_local_time(t.get("created_at"))
+        updated = to_local_time(t.get("updated_at"))
         lines.append(f"创建 {created} · 更新 {updated}")
 
         buttons = []
         if t["status"] == "running":
             buttons.append([Button.inline("⏸ 暂停", data=f"m:pause:{t['id']}")])
         elif t["status"] in ("paused", "failed"):
-            buttons.append([Button.inline("▶️ 继续克隆", data=f"m:resume:{t['id']}")])
+            resume_label = ("▶️ 继续监控" if t["type"] not in models.CLONE_TASK_TYPES
+                            else "▶️ 继续克隆")
+            buttons.append([Button.inline(resume_label, data=f"m:resume:{t['id']}")])
         buttons.append([Button.inline("🔄 刷新", data=f"m:task:{t['id']}")])
         buttons.append([Button.inline("🗑 删除", data=f"m:del:{t['id']}"),
                         Button.inline("« 任务列表", data="m:tasks")])
@@ -447,6 +537,10 @@ class MenuController:
 
         if action == "tasks":
             await self.render_tasks(event)
+            return
+
+        if action == "monitors":
+            await self.render_monitors(event)
             return
 
         if action.startswith("task:"):
@@ -693,13 +787,37 @@ class MenuController:
             await event.answer(err or "创建失败", alert=True)
             return
 
+        # 已存在相同的监控任务：不重复创建，直接把已有任务展示出来
+        if err == "exists":
+            self.drop(event.chat_id, event.sender_id)
+            existing = await models.get_task(self.db, task_id) or {}
+            status = existing.get("status", "running")
+            await event.answer("该监控任务已存在，未重复创建", alert=True)
+            text = (f"ℹ️ 相同的监控任务已存在：#{task_id}（{status}）\n"
+                    "未重复创建，避免同一条消息被转发两次。")
+            buttons = []
+            if status in ("paused", "failed"):
+                text += "\n需要继续接收新消息，请点「继续监控」。"
+                buttons.append([Button.inline("▶️ 继续监控", data=f"m:resume:{task_id}")])
+            buttons.append([Button.inline("📋 查看详情", data=f"m:task:{task_id}")])
+            buttons.append([Button.inline("📡 全部监控", data="m:monitors"),
+                            Button.inline("« 主菜单", data="m:home")])
+            try:
+                await event.edit(text, buttons=buttons)
+            except Exception:
+                pass
+            return
+
         self.drop(event.chat_id, event.sender_id)
         await event.answer(f"任务 #{task_id} 已创建")
-        # 启动消息由 create_task 回调发出（它需要消息 ID 来实时刷新进度），
+        # 启动/确认消息由 create_task 回调发出（克隆需要消息 ID 来实时刷新进度），
         # 这里只把向导消息收尾，避免留下一个可点的旧键盘。
+        done_text = (f"✅ 监控任务 #{task_id} 已创建，开始监听新消息。"
+                     if wiz.kind == "monitor" else
+                     f"✅ 任务 #{task_id} 已启动，进度见下方消息。")
         try:
             await event.edit(
-                f"✅ 任务 #{task_id} 已启动，进度见下方消息。",
+                done_text,
                 buttons=[[Button.inline("📋 查看详情", data=f"m:task:{task_id}")],
                          [Button.inline("« 主菜单", data="m:home")]])
         except Exception:

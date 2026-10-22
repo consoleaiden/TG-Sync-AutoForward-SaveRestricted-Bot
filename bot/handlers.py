@@ -30,7 +30,7 @@ from bot.telegram_utils import (
     resolve_topic_name, describe_source,
     get_target_topic_id, build_source_link, truncate,
 )
-from core.clone_plan import parse_start_time, progress_bar
+from core.clone_plan import parse_start_time, progress_bar, to_local_time
 from core.message_logic import (
     classify_message_kind,
     collect_album_messages,
@@ -575,6 +575,72 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         title = await _format_chat_topic_display(chat_id, topic_id, prefer_bot=True)
         return {"chat_id": chat_id, "topic_id": topic_id, "title": title}, None
 
+    async def _create_monitor_task(*, source_id: int, target_chat_id: int,
+                                   mode: str,
+                                   source_topic_id: int | None = None,
+                                   target_topic_id: int | None = None,
+                                   source_title: str | None = None,
+                                   target_title: str | None = None,
+                                   notify_chat_id: int | None = None,
+                                   created_by: int | None = None,
+                                   userbot: TelegramClient | None = None,
+                                   ) -> tuple[int | None, str | None, bool]:
+        """建监控任务 → 去重 → 发确认消息 → 注册监听。
+
+        返回 (task_id, err, created)。同一「源话题→目标话题」已有运行中/暂停的
+        监控任务时直接复用，不重复创建（created=False），避免同一消息被转发两次。
+        """
+        existing = await models.find_monitor_task(
+            db, source_id, target_chat_id, source_topic_id, target_topic_id)
+        if existing:
+            logger.info("监控任务重复：已有 #%s（%s），跳过创建",
+                        existing["id"], existing["status"])
+            return existing["id"], "exists", False
+
+        task_id = await models.create_task(
+            db, "monitor", source_id, target_chat_id, mode,
+            source_topic_id=source_topic_id,
+            target_topic_id=target_topic_id,
+            source_title=source_title,
+            target_title=target_title,
+            notify_chat_id=notify_chat_id,
+            created_by=created_by)
+        await monitor_manager.start_monitor(
+            task_id, source_id, target_chat_id, mode,
+            source_topic_id=source_topic_id,
+            target_topic_id=target_topic_id,
+            userbot=userbot)
+
+        src_desc = source_title or await _format_chat_topic_display(
+            source_id, source_topic_id)
+        tgt_desc = target_title or await _format_chat_topic_display(
+            target_chat_id, target_topic_id, prefer_bot=True)
+        scope = f"仅话题 #{source_topic_id}" if source_topic_id else "全部新消息"
+        lines = [
+            f"👁 监控任务 #{task_id} 已创建，正在监听",
+            f"📌 源: {src_desc}",
+            f"🎯 目标: {tgt_desc}",
+            f"📋 模式: {'复制' if mode == 'copy' else '转发'}",
+            f"🧩 范围: {scope}",
+            "",
+            "收到新消息会自动转发到目标；已转发条数与最近活动可在「监控任务」里查看。",
+        ]
+        chat_id = notify_chat_id or target_chat_id
+        try:
+            msg = await bot.send_message(
+                chat_id, "\n".join(lines),
+                reply_to=target_topic_id or None,
+                buttons=[[Button.inline("📋 详情", data=f"m:task:{task_id}"),
+                          Button.inline("👁 监控任务", data="m:monitors")],
+                         [Button.inline("⏸ 暂停", data=f"m:pause:{task_id}")]])
+            await models.update_task_notify(db, task_id, chat_id, msg.id)
+        except Exception as e:
+            logger.warning("发送监控任务确认消息失败: %s", e)
+
+        logger.info("监控任务 #%s 创建成功: source=%s topic=%s -> target=%s",
+                    task_id, source_id, source_topic_id, target_chat_id)
+        return task_id, None, True
+
     async def _menu_create_task(payload: dict, event):
         kind = payload.get("kind")
         source_id = payload["source_chat_id"]
@@ -585,24 +651,29 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         start = payload.get("start") or {}
 
         if kind == "monitor":
+            # 先去重再校验 UserBot：重复时不必再发一轮 RPC 探测
+            existing = await models.find_monitor_task(
+                db, source_id, target_chat_id, source_topic_id, target_topic_id)
+            if existing:
+                return existing["id"], "exists"
             ok, reason, ub = await _ensure_userbot_joined_source_for_monitor(
                 source_id, source_topic_id)
             if not ok:
                 return None, truncate((reason or "UserBot 未加入源").replace("\n", " "), 150)
-            task_id = await models.create_task(
-                db, "monitor", source_id, target_chat_id, mode,
+            task_id, err, created = await _create_monitor_task(
+                source_id=source_id,
+                target_chat_id=target_chat_id,
+                mode=mode,
                 source_topic_id=source_topic_id,
                 target_topic_id=target_topic_id,
                 source_title=payload.get("source_title"),
                 target_title=payload.get("target_title"),
                 notify_chat_id=payload.get("chat_id"),
-                created_by=payload.get("sender_id"))
-            await monitor_manager.start_monitor(
-                task_id, source_id, target_chat_id, mode,
-                source_topic_id=source_topic_id,
-                target_topic_id=target_topic_id,
+                created_by=payload.get("sender_id"),
                 userbot=ub or payload.get("userbot"))
-            return task_id, None
+            if err and err != "exists":
+                return None, err
+            return task_id, (None if created else "exists")
 
         # 「继续上次进度」= 复用原任务，不新建
         if start.get("kind") == "resume" and start.get("task_id"):
@@ -1234,28 +1305,23 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         logger.info("创建监控任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s (UserBot: %s)",
                      source_id, parsed.topic_id, target_chat_id, target_topic_id, mode,
                      getattr(active_ub, '_phone', 'default'))
-        task_id = await models.create_task(
-            db, "monitor", source_id, target_chat_id, mode,
-            source_topic_id=parsed.topic_id,
-            target_topic_id=target_topic_id)
-
-        await monitor_manager.start_monitor(
-            task_id, source_id, target_chat_id, mode,
+        task_id, err, created = await _create_monitor_task(
+            source_id=source_id,
+            target_chat_id=target_chat_id,
+            mode=mode,
             source_topic_id=parsed.topic_id,
             target_topic_id=target_topic_id,
+            notify_chat_id=event.chat_id,
+            created_by=event.sender_id,
             userbot=active_ub)
-
-        source_desc = await _format_chat_topic_display(source_id, parsed.topic_id)
-        target_desc = await _format_chat_topic_display(
-            target_chat_id, target_topic_id, prefer_bot=True
-        )
-        logger.info("监控任务 #%s 已启动", task_id)
-        await event.reply(
-            f"👁 监控任务 #{task_id} 已启动\n"
-            f"📌 源: {source_desc}\n"
-            f"🎯 目标: {target_desc}\n"
-            "✅ 已校验 UserBot 可访问该源\n"
-            f"📋 模式: {mode}")
+        if not task_id:
+            await event.reply(f"❌ {err or '创建监控任务失败'}")
+            return
+        if not created:
+            t = await models.get_task(db, task_id) or {}
+            await event.reply(
+                f"ℹ️ 该监控已存在：任务 #{task_id}（{t.get('status', 'unknown')}），未重复创建。\n"
+                f"用 /list 查看已转发条数，或发 /menu 进「监控任务」管理。")
 
     @bot.on(events.NewMessage(pattern=r"/list(?:@\w+)?$"))
     async def on_list(event):
@@ -1308,6 +1374,31 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 f" · 跳过 {int(t.get('skip_count') or 0):,}")
             if t.get("last_error"):
                 text += f"\n最近错误: {str(t['last_error'])[:80]}"
+        else:
+            # 监控任务：显示已转发条数、最近消息与最近活动
+            try:
+                stats = await monitor_manager.get_live_stats(task_id)
+            except Exception:
+                stats = {
+                    "done": int(t.get("done_count") or 0),
+                    "fail": int(t.get("fail_count") or 0),
+                    "skip": int(t.get("skip_count") or 0),
+                    "last_msg_id": int(t.get("last_synced_msg_id") or 0),
+                    "last_error": t.get("last_error"),
+                    "updated_at": t.get("updated_at"),
+                }
+            scope = (f"仅话题 #{t['source_topic_id']}"
+                     if t.get("source_topic_id") else "全部新消息")
+            text += (
+                f"\n监听范围: {scope}"
+                f"\n已转发 {stats['done']:,} 条 · 失败 {stats['fail']}"
+                f" · 跳过 {stats['skip']}")
+            if stats.get("last_msg_id"):
+                text += f"\n最近消息: msg_id={stats['last_msg_id']}"
+            if stats.get("updated_at"):
+                text += f"\n最近活动: {to_local_time(stats['updated_at'])}"
+            if stats.get("last_error"):
+                text += f"\n最近错误: {str(stats['last_error'])[:80]}"
 
         buttons = []
         if source_link:

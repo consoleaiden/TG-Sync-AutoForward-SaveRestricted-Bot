@@ -14,14 +14,14 @@
 - **链接解析** — 私聊发送 `t.me/...` 链接即可触发，支持公开/私有频道、群组、评论区、话题
 - **历史同步** — `/sync` 拉取历史消息，支持断点续传；受限消息自动通过 Takeout 内联转发
 - **受限消息补发** — `/syncrestrictedmsg` 通过 Telegram Takeout 导出接口，仅补发被平台限制的消息
-- **实时监控** — `/monitor` 监听新消息并自动转发
+- **实时监控** — `/monitor` 或菜单创建，监听新消息自动转发；「📡 监控任务」页可查每个任务的源、目标与已转发条数，重复添加同一监控会被拦下
 - **多级降级** — Bot 直发 → UserBot 辅助 → 下载重传 → 失败标记 `#fail2forward`
 - **相册感知** — 优先整组发送，失败后逐条降级
 - **硬封禁过滤** — 自动跳过全平台受限（`platform=all`）的内容；仅限部分平台的限制不受影响
 - **双模式** — 支持 `copy`（默认）和 `forward` 两种转发模式
 - **代理自愈** — 网络无法直连 Telegram 时，自动从公共 MTProto 代理榜单选优（见 [docs/proxy-auto.md](docs/proxy-auto.md)）
 
-克隆功能的完整说明见 [docs/clone.md](docs/clone.md)。
+克隆功能的完整说明见 [docs/clone.md](docs/clone.md)；监控任务的进度口径与防重复规则见 [docs/monitor.md](docs/monitor.md)。
 
 ## 架构
 

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ── 时间解析 ──────────────────────────────────────────────────────────────
 
@@ -62,6 +62,22 @@ def parse_start_time(text: str, *, tz=None) -> datetime | None:
 def format_time(dt: datetime) -> str:
     """统一的人类可读时间（YYYY-MM-DD HH:MM）。"""
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def to_local_time(value) -> str:
+    """把 SQLite 的 UTC 时间戳转成本机时区显示。
+
+    CURRENT_TIMESTAMP 存的是 UTC（'YYYY-MM-DD HH:MM:SS'），容器时区设成
+    Asia/Shanghai 后直接展示会差 8 小时，"最近活动" 会让人误判。
+    """
+    if not value:
+        return ""
+    text = str(value).strip().replace("T", " ")
+    try:
+        dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text[:16]
+    return format_time(dt.replace(tzinfo=timezone.utc).astimezone())
 
 
 # ── 进度渲染 ──────────────────────────────────────────────────────────────
