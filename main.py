@@ -10,6 +10,13 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from db.database import Database
 from bot.handlers import register_handlers
 from core.monitor import MonitorManager
+from core.storage import (
+    audit_db_path,
+    format_audit,
+    persistence_warning,
+    resolve_db_path,
+    wal_enabled,
+)
 from core.userbot_manager import UserBotManager, UserBotNotAuthorized
 from core.keepalive import install as install_keepalive
 from core.proxy_manager import (
@@ -277,14 +284,22 @@ async def main():
     except ImportError:
         logger.warning("未检测到 cryptg，当前使用低速 pure-python pyaes，大文件下载/上传速度可能受限")
 
-    # 确保所需目录存在
-    os.makedirs("data", exist_ok=True)
+    # 确保所需目录存在（数据库目录按 storage.db_path 的实际位置创建）
+    db_path = resolve_db_path(config)
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)) or ".", exist_ok=True)
     os.makedirs("sessions", exist_ok=True)
 
-    # 初始化数据库
-    db = Database("data/bot.db")
+    # 初始化数据库：先记录「升级前是否已有库」，再连接
+    pre_audit = audit_db_path(db_path, config=config)
+    db = Database(db_path, wal=wal_enabled(config))
     await db.init()
-    logger.info("数据库初始化完成")
+    storage_audit = audit_db_path(db_path, config=config)
+    logger.info("数据库初始化完成 · %s", format_audit(storage_audit))
+    warning = persistence_warning(storage_audit, db_path)
+    if warning:
+        logger.warning("%s", warning)
+    elif pre_audit["existed"]:
+        logger.info("沿用已有数据库，历史任务与克隆进度保持不变")
 
     # 初始化 Bot 客户端（auto/manual 代理模式时走 MTProto 代理连接）
     bot = create_client(
@@ -303,6 +318,7 @@ async def main():
         # 完成登录后容器重启即可自动恢复。
         logger.critical("%s", e)
         logger.critical("进程退出（退出码 78），修复后 Docker 会自动重启并恢复运行")
+        await db.close()
         sys.exit(78)
     await _setup_bot(bot, userbot_manager, db, config)
 
@@ -314,44 +330,52 @@ async def main():
 
     # === 运行 + 断线重连循环 ===
     reconnect_count = 0
-    while True:
-        try:
-            logger.info("所有服务就绪，等待消息...")
-            await bot.run_until_disconnected()
-        except (ConnectionError, OSError) as e:
-            logger.error("连接丢失: %s", e)
-        except Exception as e:
-            logger.error("未预期异常: %s", e, exc_info=True)
+    try:
+        while True:
+            try:
+                logger.info("所有服务就绪，等待消息...")
+                await bot.run_until_disconnected()
+            except (ConnectionError, OSError) as e:
+                logger.error("连接丢失: %s", e)
+            except Exception as e:
+                logger.error("未预期异常: %s", e, exc_info=True)
 
-        # run_until_disconnected() 返回 → 说明连接已断开，进入重连
-        reconnect_count += 1
-        if reconnect_count > MAX_RECONNECT_ATTEMPTS:
-            logger.critical(
-                "连续 %d 次重连均失败，进程退出（交由 systemd 重启）",
-                MAX_RECONNECT_ATTEMPTS,
+            # run_until_disconnected() 返回 → 说明连接已断开，进入重连
+            reconnect_count += 1
+            if reconnect_count > MAX_RECONNECT_ATTEMPTS:
+                logger.critical(
+                    "连续 %d 次重连均失败，进程退出（交由 systemd 重启）",
+                    MAX_RECONNECT_ATTEMPTS,
+                )
+                sys.exit(1)
+
+            delay = min(
+                RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
+                RECONNECT_MAX_DELAY,
             )
-            sys.exit(1)
+            logger.warning(
+                "第 %d/%d 次重连，等待 %d 秒...",
+                reconnect_count, MAX_RECONNECT_ATTEMPTS, delay,
+            )
+            await asyncio.sleep(delay)
 
-        delay = min(
-            RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
-            RECONNECT_MAX_DELAY,
-        )
-        logger.warning(
-            "第 %d/%d 次重连，等待 %d 秒...",
-            reconnect_count, MAX_RECONNECT_ATTEMPTS, delay,
-        )
-        await asyncio.sleep(delay)
-
+            try:
+                await bot.connect()
+                await userbot_manager.connect_all()
+                reconnect_count = 0   # 重连成功，重置计数
+                logger.info("重连成功")
+            except Exception as e:
+                logger.error("重连失败: %s", e)
+                # 回到 while 循环顶部，reconnect_count 已递增，继续退避
+                # 自动代理模式下连续失败时触发重新选优（可能切换代理并重启）
+                await _reconnect_proxy_check(reconnect_count, config, proxy_candidate)
+    finally:
+        # 正常退出/收到 KeyboardInterrupt 时把 WAL 合并回主库，确保宿主机的
+        # bot.db 是完整一致的一份（进程被强杀时 WAL 也会在下次打开自动回放）。
         try:
-            await bot.connect()
-            await userbot_manager.connect_all()
-            reconnect_count = 0   # 重连成功，重置计数
-            logger.info("重连成功")
+            await db.close()
         except Exception as e:
-            logger.error("重连失败: %s", e)
-            # 回到 while 循环顶部，reconnect_count 已递增，继续退避
-            # 自动代理模式下连续失败时触发重新选优（可能切换代理并重启）
-            await _reconnect_proxy_check(reconnect_count, config, proxy_candidate)
+            logger.warning("关闭数据库时出错: %s", e)
 
 
 if __name__ == "__main__":

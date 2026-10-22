@@ -43,6 +43,18 @@ allow_public_resolve: true
 # 私聊解析返回消息时，是否在文字末尾嵌入原消息来源链接（格式：[Source Link](url)）
 append_source_link: true
 
+# ── 数据存储（克隆进度 / 任务 / 消息映射所在的 SQLite）──────────────────
+# 默认 data/bot.db；只要该目录被挂载到宿主机（docker compose 默认 ./data:/app/data），
+# 升级镜像重建容器时进度就不会丢。放到别处时记得同步加一条 volume，
+# 启动日志会自检并提示「未持久化」。
+storage:
+  db_path: data/bot.db # 环境变量 TG_DB_PATH 优先级更高
+  wal: true # WAL 模式（写不阻塞读、崩溃自动恢复）；放 SMB/NFS 网络盘时改 false
+  backup_dir: "" # 留空 = 数据库同级的 backups/（即 ./data/backups）
+  backup_keep: 7 # 「备份数据库」按钮/N 份保留策略，超出自动删最旧
+  # 容器内被视为「已持久化」的目录（对应挂载点），一般不用改
+  persist_dirs: []
+
 # ── 克隆任务 ─────────────────────────────────────────────────────────────
 clone:
   # 进程重启（崩溃 / 换代理重启 / 更新部署）后自动从断点继续未完成的克隆任务。

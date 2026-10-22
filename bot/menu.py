@@ -8,7 +8,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -22,7 +24,9 @@ from core.clone_plan import (
     progress_bar,
     to_local_time,
 )
+from core.storage import audit_db_path, backup_settings, format_audit
 from db import models
+from db.backup import backup_database, human_size, restore_hint
 
 logger = logging.getLogger("tg_forward_bot.menu")
 
@@ -142,8 +146,9 @@ class MenuController:
             [Button.inline("👁 实时监控新消息", data="m:new:monitor")],
             [Button.inline("📋 我的任务与进度", data="m:tasks")],
             [Button.inline("📡 监控任务（已配置）", data="m:monitors")],
-            [Button.inline("⚙️ 限流设置", data="m:settings"),
-             Button.inline("❓ 使用说明", data="m:help")],
+            [Button.inline("💾 备份数据库", data="m:backup"),
+             Button.inline("⚙️ 限流设置", data="m:settings")],
+            [Button.inline("❓ 使用说明", data="m:help")],
         ]
         return text, buttons
 
@@ -522,6 +527,41 @@ class MenuController:
 
         return self
 
+    async def _on_backup(self, event):
+        """把 SQLite 在线快照到 data/backups（随 ./data 挂载留在宿主机）。"""
+        db_path = getattr(self.db, "db_path", "data/bot.db")
+        opts = backup_settings(self.config)
+        target_dir = opts["backup_dir"] or os.path.join(
+            os.path.dirname(os.path.abspath(db_path)) or ".", "backups")
+        await event.answer("正在备份…")
+        try:
+            info = await asyncio.to_thread(
+                backup_database, db_path,
+                backup_dir=target_dir, keep=opts["keep"],
+            )
+        except FileNotFoundError:
+            await event.answer("数据库文件还不存在，暂无内容可备份", alert=True)
+            return
+        except Exception as e:
+            logger.error("数据库备份失败: %s", e, exc_info=True)
+            await event.answer(f"备份失败: {e}", alert=True)
+            return
+
+        text = (
+            "💾 数据库备份完成\n\n"
+            f"• 文件：{info['path']}\n"
+            f"• 大小：{human_size(info['size'])}\n"
+            f"• 现有备份：{info['total']} 份（保留最近 {info['keep']} 份"
+            f"{'，已清理 %d 份旧备份' % len(info['removed']) if info['removed'] else ''}）\n\n"
+            "备份目录在挂载的 ./data 内，升级镜像不会丢。\n\n"
+            "如需恢复：\n"
+            f"{restore_hint(os.path.abspath(db_path), info['path'])}"
+        )
+        await event.edit(text, buttons=[
+            [Button.inline("💾 再备份一份", data="m:backup"),
+             Button.inline("« 主菜单", data="m:home")],
+        ])
+
     async def _dispatch(self, event, action: str):
         if action == "home":
             self.drop(event.chat_id, event.sender_id)
@@ -541,6 +581,10 @@ class MenuController:
 
         if action == "monitors":
             await self.render_monitors(event)
+            return
+
+        if action == "backup":
+            await self._on_backup(event)
             return
 
         if action.startswith("task:"):
@@ -568,6 +612,13 @@ class MenuController:
 
         if action == "settings":
             rl = (self.config.get("rate_limit") or {})
+            audit = audit_db_path(getattr(self.db, "db_path", "data/bot.db"),
+                                  config=self.config)
+            store_state = {
+                True: "✅ 已挂载到宿主机，升级镜像不会丢",
+                False: "⚠️ 未挂载，升级镜像会丢（见 docs/storage.md）",
+                None: "本地磁盘，直接落盘",
+            }[audit["persisted"]]
             text = (
                 "⚙️ 当前限流设置\n"
                 f"• 每批消息数: {rl.get('batch_size', 100)}\n"
@@ -576,6 +627,9 @@ class MenuController:
                 f"{rl.get('batch_pause_time', [30, 60])}\n"
                 f"• FloodWait 倍增: {rl.get('flood_wait_multiplier', 2)}\n"
                 f"• 最大等待: {rl.get('max_flood_wait', 300)}s\n\n"
+                "💾 数据存储\n"
+                f"• {format_audit(audit)}\n"
+                f"• {store_state}\n\n"
                 "修改 config.yaml 后立即生效，无需重启。"
             )
             await event.edit(text, buttons=[[Button.inline("« 主菜单", data="m:home")]])
@@ -591,6 +645,7 @@ class MenuController:
                 "5️⃣ 确认后后台运行，可在「我的任务」暂停/继续\n\n"
                 "💡 克隆会一直跑到源的最新一条；中途断了也能接着跑。\n"
                 "💡 目标频道需要先把 Bot 设为管理员。\n"
+                "💡 克隆进度存在 data/bot.db，点「备份数据库」可随时导出快照。\n"
                 "💡 老命令 /sync、/syncrestrictedmsg 仍然可用。"
             )
             await event.edit(text, buttons=[[Button.inline("« 主菜单", data="m:home")]])

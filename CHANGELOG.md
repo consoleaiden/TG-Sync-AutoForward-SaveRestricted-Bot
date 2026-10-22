@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **数据落盘位置可配 + 持久化自检**（`core/storage.py`）：数据库路径支持
+  `TG_DB_PATH` > `config.yaml` 的 `storage.db_path` > 默认 `data/bot.db`；
+  启动时打印绝对路径/大小/是否位于宿主机挂载目录，不在挂载目录内时输出带修复步骤的
+  `WARNING`（`storage.persist_dirs` / `TG_PERSIST_DIRS` 可覆盖判定目录）。
+- **SQLite 在线备份**（`db/backup.py`、`scripts/backup_db.py`、菜单「💾 备份数据库」）：
+  用 backup API 生成一致性快照到 `data/backups/bot-YYYYmmdd-HHMMSS.db`，
+  默认保留最近 7 份（`storage.backup_keep`），随后给出可直接执行的恢复步骤；
+  也可 `docker compose exec bot python scripts/backup_db.py --keep 14` 或挂群晖任务计划。
+- **WAL 与写保护**：`Database` 默认 `journal_mode=WAL` + `synchronous=NORMAL` +
+  `busy_timeout=5000` + `foreign_keys=ON`，容器被 stop/kill、升级重建时已提交进度不丢、
+  库不损坏；正常退出自动 `wal_checkpoint(TRUNCATE)`。SMB/NFS 场景可用 `storage.wal: false` 关闭。
+- 「⚙️ 限流设置」页新增「💾 数据存储」区块，直接显示数据库路径、大小与持久化状态。
+- `docs/storage.md`：数据清单、群晖挂载步骤、自定义路径、备份/恢复/迁移、常见报错。
+- `test/test_db_persistence.py`：路径优先级、持久化判定、WAL 开关、备份内容与保留策略、
+  菜单备份入口共 19 个用例。
 - **监控任务进度与防重复**：`/monitor` 与菜单创建的监控任务现在会
   - 记录并展示进度：`done_count` / `fail_count` / `skip_count`、最近处理的消息 ID、
     最近活动时间与最近错误；内存累加、每 5 秒批量落库（`MONITOR_STATS_FLUSH_SECONDS`），
@@ -36,6 +51,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `docs/clone.md`：克隆功能说明（起点语义、进度字段、续传机制、FAQ）。
 
 ### Changed
+- `docker-compose.yaml`：补充挂载注释（`/app/data` 即数据库所在）、可选的独立 db 目录挂载示例、
+  `stop_grace_period: 20s`，并说明不要直接挂载单个 `bot.db` 文件。
+- `main.py` 启动流程改为先解析路径再建目录/连库，退出路径统一关闭数据库。
 - `core/syncer.py` 重写为**流式分批**处理（`clone.batch_size`，默认 200）：不再把整个频道的
   消息一次性读进内存，几万条的大频道也能稳定跑；相册不会被切到两批；服务消息与空消息计入
   `skip_count` 并推进游标，不会卡住；FloodWait 后自动从游标重试（最多 5 轮）。

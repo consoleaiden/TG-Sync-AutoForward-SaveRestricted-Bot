@@ -19,9 +19,10 @@
 - **相册感知** — 优先整组发送，失败后逐条降级
 - **硬封禁过滤** — 自动跳过全平台受限（`platform=all`）的内容；仅限部分平台的限制不受影响
 - **双模式** — 支持 `copy`（默认）和 `forward` 两种转发模式
+- **数据持久化** — 任务与断点存在 SQLite（`data/bot.db`），目录挂载即随镜像升级保留；菜单「💾 备份数据库」一键在线快照，启动自检会提示未持久化的路径（见 [docs/storage.md](docs/storage.md)）
 - **代理自愈** — 网络无法直连 Telegram 时，自动从公共 MTProto 代理榜单选优（见 [docs/proxy-auto.md](docs/proxy-auto.md)）
 
-克隆功能的完整说明见 [docs/clone.md](docs/clone.md)；监控任务的进度口径与防重复规则见 [docs/monitor.md](docs/monitor.md)。
+克隆功能的完整说明见 [docs/clone.md](docs/clone.md)；监控任务的进度口径与防重复规则见 [docs/monitor.md](docs/monitor.md)；数据落盘、备份与迁移见 [docs/storage.md](docs/storage.md)。
 
 ## 架构
 
@@ -145,11 +146,15 @@ docker compose pull && docker compose up -d
 2. 用「项目」导入仓库里的 `docker-compose.yaml`，或手动创建容器并按下表添加挂载；
 3. 映射路径（在共享文件夹如 `/docker/tg-sync-bot/` 下准备）：
 
-| 宿主机          | 容器               | 说明                                   |
-| --------------- | ------------------ | -------------------------------------- |
-| `./config.yaml` | `/app/config.yaml` | 配置文件（含凭据，不要提交/外泄）      |
-| `./data`        | `/app/data`        | 任务数据库 bot.db、代理选优 proxy.json |
-| `./sessions`    | `/app/sessions`    | Bot / UserBot 登录会话                 |
+| 宿主机          | 容器               | 说明                                                       |
+| --------------- | ------------------ | ---------------------------------------------------------- |
+| `./config.yaml` | `/app/config.yaml` | 配置文件（含凭据，不要提交/外泄）                          |
+| `./data`        | `/app/data`        | **SQLite 数据库 `bot.db`（克隆进度/任务）、`bot.db-wal`、`backups/`、代理选优 `proxy.json`** |
+| `./sessions`    | `/app/sessions`    | Bot / UserBot 登录会话                                     |
+
+> `./data` 这一行是「升级镜像不丢进度」的关键：镜像重建只换容器，宿主机目录里的 `bot.db` 原样保留。
+> 换成别的路径时必须同步加挂载，否则会落到容器可写层；启动日志与「⚙️ 限流设置」页都会显示数据库位置和
+> 是否已持久化。细节见 [docs/storage.md](docs/storage.md)。
 
 **镜像自动更新**（有新代码推送到 main 就跟最新版）：
 
@@ -157,6 +162,24 @@ docker compose pull && docker compose up -d
 - 或在 compose 里加一个 [Watchtower](https://containrrr.dev/watchtower/) 服务，同样能自动拉取新版并重启。
 
 镜像里的版本指纹见镜像标签 `org.opencontainers.image.revision`（对应构建时的 git commit）。
+
+## 数据持久化与备份
+
+克隆进度、任务、消息映射全部在 SQLite 里（容器内 `/app/data/bot.db`），
+只要 `./data` 挂到宿主机，`pull` 新镜像重建容器后任务与断点原样还在。
+
+```bash
+# 启动日志会自检落盘位置
+数据库初始化完成 · 数据库 /app/data/bot.db（已存在，96.0 KB，已持久化）
+
+# 手动备份（容器运行中也能做，SQLite 在线快照，不影响克隆）
+docker compose exec bot python scripts/backup_db.py --keep 14
+```
+
+- 默认 WAL 模式：`docker stop`、升级重建、掉电都不会写坏库，已提交的进度自动回放；
+- 菜单「💾 备份数据库」一键快照到 `data/backups/`，默认保留最近 7 份；
+- 自定义位置用 `storage.db_path` 或 `TG_DB_PATH`，**记得同时加目录挂载**；
+- 完整说明（群晖映射、恢复步骤、迁移新机、常见报错）见 [docs/storage.md](docs/storage.md)。
 
 ## 无法直连 Telegram？MTProto 代理自动选优
 

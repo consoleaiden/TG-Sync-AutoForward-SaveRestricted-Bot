@@ -54,8 +54,9 @@ _TASKS_MIGRATIONS: list[tuple[str, str]] = [
 
 
 class Database:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, wal: bool = True):
         self.db_path = db_path
+        self.wal = wal
         self.db: aiosqlite.Connection | None = None
 
     async def init(self):
@@ -64,7 +65,34 @@ class Database:
             os.makedirs(parent, exist_ok=True)
         self.db = await aiosqlite.connect(self.db_path)
         self.db.row_factory = aiosqlite.Row
+        await self._apply_pragmas()
         await self._create_tables()
+
+    async def _apply_pragmas(self):
+        """让库在「容器被 kill / 掉电」场景下也不易损坏。
+
+        * WAL：写事务不阻塞读，进程被强杀后下次打开自动回放；
+        * synchronous=NORMAL：WAL 下的推荐值，进程崩溃不丢已提交事务；
+        * busy_timeout：备份脚本与 bot 同时读写时自动等锁，而不是立刻报
+          database is locked；
+        * foreign_keys：message_map.task_id 的外键约束真正生效。
+        """
+        if self.wal:
+            await self.db.execute("PRAGMA journal_mode=WAL")
+            await self.db.execute("PRAGMA synchronous=NORMAL")
+        await self.db.execute("PRAGMA busy_timeout=5000")
+        await self.db.execute("PRAGMA foreign_keys=ON")
+        await self.db.commit()
+
+    async def checkpoint(self):
+        """把 WAL 内容合并回主库文件（关闭/备份前调用，减少 -wal 体积）。"""
+        if not self.db:
+            return
+        try:
+            await self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await self.db.commit()
+        except Exception as e:      # 非 WAL 模式或只读挂载时忽略
+            logger.debug("wal_checkpoint 跳过: %s", e)
 
     async def _create_tables(self):
         await self.db.executescript(_TASKS_DDL + """
@@ -96,4 +124,7 @@ class Database:
 
     async def close(self):
         if self.db:
+            await self.checkpoint()
             await self.db.close()
+            self.db = None
+            logger.info("数据库已关闭：%s", self.db_path)

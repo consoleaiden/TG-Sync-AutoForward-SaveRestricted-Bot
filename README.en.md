@@ -126,11 +126,29 @@ docker compose up -d --build
 
 Volume mounts:
 
-| Host            | Container          |
-| --------------- | ------------------ |
-| `./config.yaml` | `/app/config.yaml` |
-| `./data`        | `/app/data`        |
-| `./sessions`    | `/app/sessions`    |
+| Host            | Container          | Contents                                                        |
+| --------------- | ------------------ | --------------------------------------------------------------- |
+| `./config.yaml` | `/app/config.yaml` | Configuration (contains credentials)                            |
+| `./data`        | `/app/data`        | **SQLite `bot.db` (clone progress / tasks), `bot.db-wal`, `backups/`, `proxy.json`** |
+| `./sessions`    | `/app/sessions`    | Bot / UserBot login sessions                                    |
+
+### Data persistence & backup
+
+Clone cursors, tasks and message maps live in SQLite (`/app/data/bot.db`). As long as `./data`
+is bind-mounted, pulling a new image and recreating the container keeps everything.
+
+```bash
+# Startup log reports where the DB lives and whether it survives image upgrades
+Database ready · /app/data/bot.db (existing, 96.0 KB, persisted)
+
+# Online snapshot (safe while the bot is running)
+docker compose exec bot python scripts/backup_db.py --keep 14
+```
+
+- WAL is enabled by default: `docker stop`, container recreation and power loss won't corrupt the DB;
+- Menu button "💾 备份数据库" snapshots to `data/backups/`, keeping the latest 7 by default;
+- Custom location: `storage.db_path` or `TG_DB_PATH` — remember to add the matching volume;
+- Full guide (Synology mapping, restore, migration, troubleshooting): [docs/storage.md](docs/storage.md).
 
 ## Important Notes
 

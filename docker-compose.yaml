@@ -9,7 +9,17 @@ services:
     environment:
       # 日志时间与宿主机对齐（镜像内已装 tzdata）
       TZ: ${TZ:-Asia/Shanghai}
+      # 数据库位置。默认 data/bot.db；只有改了 config.yaml 的 storage.db_path
+      # 或想把库放到别的目录时才需要取消注释（优先级高于配置文件）。
+      # TG_DB_PATH: /app/data/bot.db
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      # ⬇ 克隆进度/Task/消息映射都在 /app/data/bot.db（WAL 另有 bot.db-wal、bot.db-shm）
+      #   这一行是「升级镜像不丢进度」的关键：目录挂到宿主机，容器重建也不影响
       - ./data:/app/data
       - ./sessions:/app/sessions
+      # 想把数据库单独放一个目录时用下面这条，并把 TG_DB_PATH 指到 /app/db/bot.db
+      # （注意：不要直接挂载单个 bot.db 文件，首次启动 Docker 会把它建成目录）
+      # - ./db:/app/db
+    # 停止时给进程留出把 WAL 合并回主库的时间（默认 10s 也够用，WAL 本身可恢复）
+    stop_grace_period: 20s
