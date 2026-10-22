@@ -1,0 +1,24 @@
+# 敏感与运行时文件 —— 绝不能打进公开镜像
+config.yaml
+data/
+sessions/
+*.session
+*.session-journal
+.env
+
+# 开发与版本控制
+.git/
+.github/
+.codegraph/
+.claude/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+reports/
+
+# 文档与测试（不影响运行）
+docs/
+test/
+*.md
+!README.md

@@ -1,6 +1,10 @@
 services:
   bot:
-    build: .
+    # 使用 CI 构建的官方镜像（docker compose up -d 时自动拉取）
+    image: ghcr.io/consoleaiden/tg-sync-autoforward-saverestricted-bot:latest
+    # 本地开发想用源码构建时，取消下行注释并执行 docker compose up -d --build
+    # build: .
+    container_name: tg-sync-bot
     restart: unless-stopped
     volumes:
       - ./config.yaml:/app/config.yaml:ro

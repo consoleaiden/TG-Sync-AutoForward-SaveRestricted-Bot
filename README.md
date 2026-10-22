@@ -1,155 +1,202 @@
 # TG Forward Bot
 
-[中文文档](./README.zh-CN.md)
+[English](./README.en.md)
 
-A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-client architecture. Supports link parsing, historical message sync, real-time monitoring, and multi-strategy graceful degradation.
+基于 Telethon 的 Telegram 消息转发工具，采用 **Bot + UserBot** 双客户端架构，支持私聊链接解析、历史消息同步、实时监控转发和多级策略自动降级。
 
-## Features
+## 功能特性
 
-- **Button Menu** — `/start` opens a guided, button-driven menu; no commands or arguments to memorise
-- **Channel Cloning** — Clone any channel/group (including forum topics) from the earliest message to the latest
-- **Selectable Start Point** — From the beginning, from a message ID, from a date/time, or resume the previous run
-- **Live Progress** — Progress bar, percentage, speed and ETA, refreshed in place on a single message
-- **Resumable** — Pause, crash or restart and it continues from the saved cursor with no duplicates or gaps
-- **Link Parsing** — Send a `t.me/...` link in private chat to trigger forwarding; supports public/private channels, groups, comments, and forum topics
-- **Historical Sync** — `/sync` pulls past messages with resumable progress tracking; restricted messages are automatically forwarded via Takeout inline
-- **Restricted Message Sync** — `/syncrestrictedmsg` re-exports only platform-restricted messages using Telegram's Takeout API
-- **Real-Time Monitoring** — `/monitor` watches for new messages and forwards them automatically
-- **Graceful Degradation** — Bot direct → UserBot-assisted → download & re-upload → failure marker `#fail2forward`
-- **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
-- **Hard-Block Filtering** — Automatically skips globally restricted content (`platform=all`); platform-specific restrictions are still forwarded
-- **Dual Mode** — Supports both `copy` (default) and `forward` transfer modes
+- **按钮菜单** — `/start` 打开图形菜单，向导式创建任务，无需记命令和参数
+- **频道克隆** — 把任意频道/群组（含话题）从最早一条克隆到最新一条
+- **起点可选** — 从头 / 从指定消息 ID / 从指定时间 / 继续上次进度
+- **进度可见** — 进度条、百分比、速率、剩余时间，原地刷新不刷屏
+- **断点续传** — 暂停、崩溃、重启后都从游标继续，不重复不遗漏
+- **链接解析** — 私聊发送 `t.me/...` 链接即可触发，支持公开/私有频道、群组、评论区、话题
+- **历史同步** — `/sync` 拉取历史消息，支持断点续传；受限消息自动通过 Takeout 内联转发
+- **受限消息补发** — `/syncrestrictedmsg` 通过 Telegram Takeout 导出接口，仅补发被平台限制的消息
+- **实时监控** — `/monitor` 监听新消息并自动转发
+- **多级降级** — Bot 直发 → UserBot 辅助 → 下载重传 → 失败标记 `#fail2forward`
+- **相册感知** — 优先整组发送，失败后逐条降级
+- **硬封禁过滤** — 自动跳过全平台受限（`platform=all`）的内容；仅限部分平台的限制不受影响
+- **双模式** — 支持 `copy`（默认）和 `forward` 两种转发模式
+- **代理自愈** — 网络无法直连 Telegram 时，自动从公共 MTProto 代理榜单选优（见 [docs/proxy-auto.md](docs/proxy-auto.md)）
 
-See [docs/clone.md](docs/clone.md) for the cloning guide (start points, progress fields, resume semantics, FAQ).
+克隆功能的完整说明见 [docs/clone.md](docs/clone.md)。
 
-## Architecture
+## 架构
 
-| Role        | Responsibility                                  |
-| ----------- | ----------------------------------------------- |
-| **Bot**     | Command handling, target-side delivery (write)  |
-| **UserBot** | Restricted-source access, media download (read) |
+| 角色        | 职责                         |
+| ----------- | ---------------------------- |
+| **Bot**     | 命令交互、目标发送（写）     |
+| **UserBot** | 受限来源读取、媒体下载（读） |
 
-Design principle: **UserBot reads, Bot writes** — UserBot only participates in write operations when necessary.
+设计原则：**UserBot 读，Bot 写**，仅在必要时让 UserBot 参与写入。
 
-## Prerequisites
+## 环境要求
 
 - Python 3.11+
-- Telegram `api_id` / `api_hash` ([my.telegram.org](https://my.telegram.org))
-- Bot Token ([@BotFather](https://t.me/BotFather))
-- A UserBot account (phone number login)
+- Telegram `api_id` / `api_hash`（[my.telegram.org](https://my.telegram.org)）
+- Bot Token（[@BotFather](https://t.me/BotFather)）
+- UserBot 账号（手机号登录）
 
-## Getting Started
+## 快速开始
 
-### 1. Installation & Configuration
+### 1. 安装与配置
 
 ```bash
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # Fill in api_id, api_hash, bot_token, and phone/phones
+cp config.example.yaml config.yaml   # 编辑填入你的配置 (api_id, api_hash, bot_token 及 phone/phones)
 ```
 
-### 2. UserBot Login & Session Initialization
+### 2. UserBot 交互式登录与会话初始化
 
-Before starting the bot, initialize UserBot sessions via the interactive login tool (supports multiple accounts):
+首次启动前，需通过交互脚本完成 UserBot 登录（支持多账号，按顺序依次登录）：
 
-* **Using the auto-adaptive script (Recommended on Linux / VPS)**:
+* **自适应脚本（推荐，Linux / VPS）**：
   ```bash
   bash scripts/login_userbot.sh -p +8613800138000
   ```
-* **Using Python directly**:
+* **Python 直接运行**：
   ```bash
   python scripts/login_userbot.py -p +8613800138000
   ```
-* **Using Docker interactive run**:
+* **Docker 交互运行**：
   ```bash
   docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
   ```
 
-> **Notes**:
-> 1. Follow the terminal prompt to enter the SMS verification code and 2FA password. Session files are persisted in `sessions/`.
-> 2. If configuring multiple UserBots (under `phones` in `config.yaml`), run the login command once for each phone number.
-> 3. `.session` files are cross-platform SQLite databases; you can also log in on a local machine and copy the generated files to the server's `sessions/` directory.
+> **说明**：
+> 1. 终端提示输入短信验证码及 2FA 密码后，会话凭证将持久化在 `sessions/` 目录。
+> 2. 若配置了多个 UserBot（在 `config.yaml` 的 `phones` 列表中），请针对每个号码分别运行一次登录。
+> 3. `.session` 文件跨平台通用，亦可在本地电脑登录生成后直接复制到服务器 `sessions/` 目录。
 
-### 3. Start the Bot
+### 3. 启动主服务
 
 ```bash
 python main.py
 ```
 
-## Commands
+## 命令
 
-| Command                       | Description                                                                                        |
-| ----------------------------- | -------------------------------------------------------------------------------------------------- |
-| `/sync <link> [--forward]`    | Sync historical messages to the current chat; restricted messages are forwarded via Takeout inline |
-| `/syncrestrictedmsg <link>`   | Re-export only restricted messages to the current chat via Takeout                                 |
-| `/monitor <link> [--forward]` | Monitor new messages and forward to the current chat (UserBot must have joined the source)         |
-| `/list`                       | Task management: pause / resume / delete / clear                                                   |
-| `/settings`                   | View rate-limit configuration                                                                      |
-| `/start` · `/help`            | Startup guide and help                                                                             |
+| 命令                          | 说明                                                  |
+| ----------------------------- | ----------------------------------------------------- |
+| `/sync <链接> [--forward]`    | 同步历史消息到当前会话；受限消息通过 Takeout 内联转发 |
+| `/syncrestrictedmsg <链接>`   | 通过 Takeout 导出接口仅补发受限消息到当前会话         |
+| `/monitor <链接> [--forward]` | 监控新消息并转发到当前会话（需 UserBot 已加入源）     |
+| `/list`                       | 任务管理：暂停 / 恢复 / 删除 / 清空                   |
+| `/settings`                   | 查看限流配置                                          |
+| `/start` · `/help`            | 启动说明与帮助                                        |
 
-Sending a `t.me/...` link in a private chat with the bot triggers parsing and forwarding.
+私聊直接发送 `t.me/...` 链接即可触发解析与转发。
 
-## Source Access Requirements
+## 来源访问要求
 
-| Source Type             | UserBot for `/sync`                | UserBot for `/monitor`                | UserBot for `/syncrestrictedmsg`       |
-| ----------------------- | ---------------------------------- | ------------------------------------- | -------------------------------------- |
-| Public channel / group  | Usually no membership required     | **Must be a member**                  | Must be a member (Takeout requires it) |
-| Private channel / group | Must be a member with read access  | **Must be a member with read access** | Must be a member with read access      |
-| Forum topic             | Must have read access to the group | **Must be a member**                  | Must have read access to the group     |
+| 来源类型          | `/sync` 对 UserBot 的要求 | `/monitor` 对 UserBot 的要求 | `/syncrestrictedmsg` 对 UserBot 的要求 |
+| ----------------- | ------------------------- | ---------------------------- | -------------------------------------- |
+| 公开频道 / 群组   | 通常无需加入              | **必须加入**                 | 必须加入（Takeout 要求）               |
+| 私密频道 / 群组   | 必须已加入且可读          | **必须已加入且可读**         | 必须已加入且可读                       |
+| 群组话题（Forum） | 需能读取该群              | **必须加入**                 | 需能读取该群                           |
 
-- `/monitor` validates UserBot membership and access before creating a task; the task is rejected if requirements are not met.
-- `/syncrestrictedmsg` uses Telegram's Takeout API, which requires UserBot to be a member of the source chat. It scans all messages first, then opens a Takeout session to re-export only the restricted ones.
-- Bot always handles target-side delivery; source-side readability depends on whether the source is public.
+- `/monitor` 创建任务前会校验 UserBot 是否已加入并可访问源，不满足会拒绝创建。
+- `/syncrestrictedmsg` 使用 Telegram Takeout 导出接口，要求 UserBot 已加入源。先扫描全部消息识别受限内容，再通过 Takeout 会话批量补发。
+- Bot 始终负责目标侧发送；来源侧读取能力取决于来源是否公开。
 
-## Forwarding Strategy
+## 转发策略
 
-The runtime always attempts strategies in order, falling back automatically on failure:
+运行时固定按以下顺序尝试，失败自动降级：
 
-1. **Bot Direct** — Lowest cost; preferred when Bot can read the source
-2. **UserBot-Assisted** — UserBot reads the source, Bot delivers
-3. **Download & Re-upload** — UserBot downloads media, Bot re-uploads (used when content is protected or forwarding is restricted)
-4. **Failure Marker** — Sends `#fail2forward` when all strategies are exhausted
+1. **Bot 直接处理** — 成本最低，Bot 可读源时优先命中
+2. **UserBot 读取 + Bot 处理** — 源受限时由 UserBot 辅助读取
+3. **UserBot 下载 + Bot 重新上传** — 源禁止转发或内容受保护时的兜底
+4. **失败标记** — 全部失败后发送 `#fail2forward`
 
-> **Note:** "Strategy 1 succeeded" in logs means the first-tier attempt succeeded — in `copy` mode this may internally use `send_message` / `send_file`. Comment links (`?comment=`) point to the linked discussion group, which may be private even if the original post is public.
+> **提示**：日志中的"策略1成功"表示第一层尝试成功，`copy` 模式下可能实际使用的是 `send_message` / `send_file`。评论链接 `?comment=` 的消息位于 discussion 群，主贴公开不代表评论区也公开。
 
-## Docker Deployment
+## Docker 部署
 
-```bash
-# 1. Copy and configure settings
-cp config.example.yaml config.yaml
+官方镜像由 GitHub Actions 在每次代码更新后自动构建发布（支持 amd64 / arm64 双架构）：
 
-# 2. Interactively initialize UserBot session (Required on first run)
-docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
-
-# 3. Build and start the bot service in the background
-docker compose up -d --build
+```
+ghcr.io/consoleaiden/tg-sync-autoforward-saverestricted-bot:latest
 ```
 
-Volume mounts:
+**方式一：docker compose（推荐）**
 
-| Host            | Container          |
-| --------------- | ------------------ |
-| `./config.yaml` | `/app/config.yaml` |
-| `./data`        | `/app/data`        |
-| `./sessions`    | `/app/sessions`    |
+```bash
+# 1. 准备配置文件
+cp config.example.yaml config.yaml
+#    编辑 config.yaml 填入 api_id / api_hash / bot_token 等
 
-## Important Notes
+# 2. 首次交互式初始化 UserBot 登录
+docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
 
-- **Restricted messages are sent as UserBot**: Takeout media references are bound to UserBot; Bot cannot use them directly.
-- `forward` mode preserves native forwarding semantics; `copy` mode is more compatible but may trigger rate limits faster
-- For private sources, UserBot must be a member with read access — otherwise strategies 2 and 3 will both fail
-- Forum topic forwarding relies on `target_topic_id`; insufficient permissions on the target side will cause delivery failures
-- If you encounter frequent `FloodWait` errors, increase the `rate_limit` parameters in your config
-- Albums are sent as a group first; on failure, the bot falls back to per-message forwarding
+# 3. 启动（自动拉取镜像）
+docker compose up -d
 
-## Logging & Troubleshooting
+# 以后更新到最新版：
+docker compose pull && docker compose up -d
+```
 
-| Logger                             | Purpose                                        |
-| ---------------------------------- | ---------------------------------------------- |
-| `tg_forward_bot.handlers`          | Command and private-chat parsing entry point   |
-| `tg_forward_bot.link_parser`       | Link resolution and discussion group discovery |
-| `tg_forward_bot.forwarder`         | Strategy execution and fallback                |
-| `tg_forward_bot.syncer`            | Historical sync progress                       |
-| `tg_forward_bot.restricted_syncer` | Restricted message Takeout sync                |
-| `tg_forward_bot.monitor`           | Real-time monitoring events                    |
+本地开发想从源码构建时，取消 `docker-compose.yaml` 中 `build: .` 的注释后执行 `docker compose up -d --build`。
 
-For detailed operational guidance, see [`docs/operations.md`](docs/operations.md) and [`docs/architecture.md`](docs/architecture.md).
+**方式二：群晖 Container Manager（套件中心安装）**
+
+1. 打开 Container Manager → 注册表，搜索或直接下载 `ghcr.io/consoleaiden/tg-sync-autoforward-saverestricted-bot:latest`（群晖 UI 不便输入 GHCR 地址时，可用 SSH 执行 `docker pull`，再到「映像」里刷新可见）；
+2. 用「项目」导入仓库里的 `docker-compose.yaml`，或手动创建容器并按下表添加挂载；
+3. 映射路径（在共享文件夹如 `/docker/tg-sync-bot/` 下准备）：
+
+| 宿主机          | 容器               | 说明                                   |
+| --------------- | ------------------ | -------------------------------------- |
+| `./config.yaml` | `/app/config.yaml` | 配置文件（含凭据，不要提交/外泄）      |
+| `./data`        | `/app/data`        | 任务数据库 bot.db、代理选优 proxy.json |
+| `./sessions`    | `/app/sessions`    | Bot / UserBot 登录会话                 |
+
+**镜像自动更新**（有新代码推送到 main 就跟最新版）：
+
+- **群晖 Container Manager**：「容器」→ 选中容器 →「自动更新」，勾选后会在检测到镜像有新版本时自动重建容器（挂载与配置保持不变）；
+- 或在 compose 里加一个 [Watchtower](https://containrrr.dev/watchtower/) 服务，同样能自动拉取新版并重启。
+
+镜像里的版本指纹见镜像标签 `org.opencontainers.image.revision`（对应构建时的 git commit）。
+
+## 无法直连 Telegram？MTProto 代理自动选优
+
+网络无法直连 Telegram（如国内群晖 NAS）时，可开启内置的代理自动选优：每小时从
+[telegram-mtproto-proxy-list](https://github.com/consoleaiden/telegram-mtproto-proxy-list)
+拉取 `top40.json`，**在本机对每条代理做真实 FakeTLS 握手测速**，自动选用本机最快的可用代理，
+代理失效或明显更优时自动切换。
+
+```yaml
+# config.yaml
+proxy:
+  mode: auto            # off（默认直连）/ auto / manual
+  refresh_minutes: 60
+```
+
+```bash
+# 排查用：看本机实测榜单
+docker compose run --rm bot python -m core.proxy_manager --test
+```
+
+完整说明（原理、参数、群晖部署、排障）见 [docs/proxy-auto.md](./docs/proxy-auto.md)。
+
+## 注意事项
+
+- **受限消息由 UserBot 身份发出**：Takeout 获取的媒体引用绑定 UserBot，Bot 无法直接使用.
+- `forward` 模式保留原始转发语义；`copy` 模式兼容性更好但更容易触发限流
+- 私有来源必须确保 UserBot 已加入并可读，否则策略 2/3 均会失败
+- 话题转发依赖 `target_topic_id`，目标侧权限不足会导致发送失败
+- 频繁出现 `FloodWait` 时，建议调大 `rate_limit` 相关参数
+- 相册优先整组发送，失败后降级为逐条转发
+
+## 日志与排障
+
+| Logger                             | 用途                       |
+| ---------------------------------- | -------------------------- |
+| `tg_forward_bot.handlers`          | 命令与私聊解析入口         |
+| `tg_forward_bot.link_parser`       | 链接解析与 discussion 解析 |
+| `tg_forward_bot.forwarder`         | 策略执行与降级             |
+| `tg_forward_bot.syncer`            | 历史同步进度               |
+| `tg_forward_bot.restricted_syncer` | 受限消息 Takeout 同步      |
+| `tg_forward_bot.monitor`           | 实时监控事件               |
+
+详细运维文档见 [`docs/operations.md`](docs/operations.md) 与 [`docs/architecture.md`](docs/architecture.md)。
