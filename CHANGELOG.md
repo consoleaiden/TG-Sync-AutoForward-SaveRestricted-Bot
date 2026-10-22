@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **NAS 自动更新链路**（`docker-compose.yaml` 内置 `watchtower`）：CI 推送 `:latest` 后，
+  群晖上的 watchtower 每 10 分钟检查一次 digest，有新镜像就优雅停止并原地重建 bot，
+  不再需要 SSH 进去手动 `docker compose pull`。使用维护中的 fork
+  `ghcr.io/nicholas-fedor/watchtower:1.19.0`（上游 containrrr 已于 2025-12 归档），
+  固定版本避免它升级自己，`WATCHTOWER_LABEL_ENABLE` 只作用于带
+  `com.centurylinklabs.watchtower.enable=true` 的 bot 容器，`WATCHTOWER_CLEANUP` 清理旧镜像。
+  文档 `docs/auto-update.md`：原理链路、参数、私有包认证、回滚、与群晖「自动更新」的差异、排障。
 - **数据落盘位置可配 + 持久化自检**（`core/storage.py`）：数据库路径支持
   `TG_DB_PATH` > `config.yaml` 的 `storage.db_path` > 默认 `data/bot.db`；
   启动时打印绝对路径/大小/是否位于宿主机挂载目录，不在挂载目录内时输出带修复步骤的

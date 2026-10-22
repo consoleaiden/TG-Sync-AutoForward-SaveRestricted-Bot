@@ -134,7 +134,8 @@ docker compose run --rm -it bot python scripts/login_userbot.py -p +861380013800
 # 3. 启动（自动拉取镜像）
 docker compose up -d
 
-# 以后更新到最新版：
+# 以后更新：compose 里已内置 watchtower，会自动跟进 CI 新镜像；
+# 想立刻生效时再手动执行
 docker compose pull && docker compose up -d
 ```
 
@@ -158,8 +159,10 @@ docker compose pull && docker compose up -d
 
 **镜像自动更新**（有新代码推送到 main 就跟最新版）：
 
-- **群晖 Container Manager**：「容器」→ 选中容器 →「自动更新」，勾选后会在检测到镜像有新版本时自动重建容器（挂载与配置保持不变）；
-- 或在 compose 里加一个 [Watchtower](https://containrrr.dev/watchtower/) 服务，同样能自动拉取新版并重启。
+- **推荐：compose 内置的 watchtower** —— `docker-compose.yaml` 里已带 `watchtower` 服务，
+  它会每 10 分钟检查 GHCR，有新镜像就原地重建 bot。一次性执行 `docker compose up -d` 之后，
+  **以后 push 代码就不用再 SSH 进群晖敲 pull**（详见 [docs/auto-update.md](docs/auto-update.md)）；
+- **群晖 Container Manager**：「容器」→ 选中容器 →「自动更新」，勾选后会在检测到镜像有新版本时自动重建容器（挂载与配置保持不变）。
 
 镜像里的版本指纹见镜像标签 `org.opencontainers.image.revision`（对应构建时的 git commit）。
 

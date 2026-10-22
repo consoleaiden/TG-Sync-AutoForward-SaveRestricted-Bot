@@ -27,3 +27,29 @@ services:
       # - ./db:/app/db
     # 停止时给进程留出把 WAL 合并回主库的时间（默认 10s 也够用，WAL 本身可恢复）
     stop_grace_period: 20s
+    labels:
+      # 只让下面的 watchtower 盯着这个容器自动升级（其它容器一律不碰）
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ── 自动更新：CI 构建好新镜像后，这里定时检查并原地重建 bot ──────────────
+  # 一次性 `docker compose up -d` 之后就不用再 SSH 进来 pull 了；
+  # 只换镜像，不改 compose 里的新挂载/新环境变量（那种仍需手动 up -d 一次）。
+  watchtower:
+    # 上游 containrrr/watchtower 已于 2025-12 归档，改用维护中的 fork（接口完全兼容）
+    # 用 ghcr 源，国内拉取比 Docker Hub 稳；版本固定，避免它把自己升级坏
+    image: ghcr.io/nicholas-fedor/watchtower:1.19.0
+    container_name: tg-sync-watchtower
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 检查间隔（秒）：600 = 每 10 分钟看一次有没有新镜像
+      WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-600}
+      # 升级后删掉旧镜像，避免 NAS 磁盘被历史层堆满
+      WATCHTOWER_CLEANUP: "true"
+      # 只处理带 watchtower.enable=true 标签的容器（即上面的 bot）
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # 私有 GHCR 包才需要：把 `docker login ghcr.io` 得到的 config.json 挂进来
+      # WATCHTOWER_REGISTRY_AUTH: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # - /root/.docker/config.json:/config.json:ro

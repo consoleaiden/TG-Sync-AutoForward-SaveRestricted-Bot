@@ -96,7 +96,8 @@ storage:
 - 进程被 `docker stop` / 升级重建 / 掉电打断时，下次打开会自动回放 `bot.db-wal`，
   已提交的进度不会丢，也不会把库写成半截；
 - `busy_timeout=5000` 让备份脚本与 bot 同时访问时自动等锁，而不是报 `database is locked`；
-- 正常退出时会自动 `wal_checkpoint(TRUNCATE)` 把 WAL 合并回 `bot.db`。
+- 正常退出（`KeyboardInterrupt`、重连次数耗尽等）时会自动 `wal_checkpoint(TRUNCATE)` 把 WAL
+  合并回 `bot.db`；被 `SIGKILL` / 升级重建强杀时不会，但下次打开会自动回放，数据不丢。
 
 注意：
 

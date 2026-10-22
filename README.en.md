@@ -132,6 +132,13 @@ Volume mounts:
 | `./data`        | `/app/data`        | **SQLite `bot.db` (clone progress / tasks), `bot.db-wal`, `backups/`, `proxy.json`** |
 | `./sessions`    | `/app/sessions`    | Bot / UserBot login sessions                                    |
 
+### Auto-update (no SSH needed)
+
+`docker-compose.yaml` ships a `watchtower` service: it polls GHCR every 10 minutes and recreates
+`tg-sync-bot` with the newly built image (only containers labelled
+`com.centurylinklabs.watchtower.enable=true`, i.e. the bot). Run `docker compose up -d` once and a
+`git push` is all it takes afterwards. Details: [docs/auto-update.md](docs/auto-update.md).
+
 ### Data persistence & backup
 
 Clone cursors, tasks and message maps live in SQLite (`/app/data/bot.db`). As long as `./data`
