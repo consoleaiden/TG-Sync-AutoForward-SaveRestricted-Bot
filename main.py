@@ -209,14 +209,15 @@ async def _setup_bot(bot: TelegramClient, userbot_manager: UserBotManager,
         scope=BotCommandScopeDefault(),
         lang_code="",
         commands=[
-            BotCommand(command="start", description="开始使用"),
-            BotCommand(command="help", description="使用说明"),
-            BotCommand(command="sync", description="同步历史消息到当前群"),
-            BotCommand(command="syncrestrictedmsg", description="通过 Takeout导出数据接口 补发受限消息"),
-            BotCommand(command="takeout", description="通过 Takeout 导出接口解析单条消息链接"),
-            BotCommand(command="monitor", description="监控新消息（需UserBot先加入源）"),
-            BotCommand(command="list", description="管理所有任务"),
+            BotCommand(command="start", description="打开菜单（推荐）"),
+            BotCommand(command="clone", description="克隆频道历史（向导）"),
+            BotCommand(command="list", description="我的任务与进度"),
+            BotCommand(command="sync", description="克隆历史消息（命令式）"),
+            BotCommand(command="syncrestrictedmsg", description="Takeout 补发受限消息"),
+            BotCommand(command="takeout", description="Takeout 解析单条链接"),
+            BotCommand(command="monitor", description="实时监控新消息"),
             BotCommand(command="settings", description="查看限流配置"),
+            BotCommand(command="help", description="使用说明"),
         ],
     ))
     logger.info("Bot 命令菜单已更新")
@@ -224,19 +225,14 @@ async def _setup_bot(bot: TelegramClient, userbot_manager: UserBotManager,
     # 注册 Bot 命令处理器
     primary_ub = userbot_manager.primary_userbot
     monitor_manager = MonitorManager(bot, primary_ub, db, config, userbot_manager=userbot_manager)
-    register_handlers(bot, primary_ub, db, config, monitor_manager, userbot_manager=userbot_manager)
-    logger.info("命令处理器已注册")
+    runtime = register_handlers(bot, primary_ub, db, config, monitor_manager,
+                               userbot_manager=userbot_manager)
+    logger.info("命令处理器与按钮菜单已注册")
 
-    # 恢复之前运行中的 monitor 任务；将孤立的 sync 任务自动暂停
-    from db import models as _models
-    _running = await _models.get_tasks_by_status(db, "running")
-    _paused_count = 0
-    for _t in _running:
-        if _t["type"] in ("sync", "sync_restricted"):
-            await _models.update_task_status(db, _t["id"], "paused")
-            _paused_count += 1
-    if _paused_count:
-        logger.info("已将 %d 个孤立的同步任务自动暂停（可通过 /list 恢复）", _paused_count)
+    # 恢复被上次进程中断的克隆任务（config.clone.auto_resume 控制）
+    resumed, failed = await runtime.auto_resume_clones()
+    if resumed or failed:
+        logger.info("启动恢复：续传 %d 个克隆任务，%d 个续传失败已置为暂停", resumed, failed)
     await monitor_manager.restore_tasks()
 
     return monitor_manager

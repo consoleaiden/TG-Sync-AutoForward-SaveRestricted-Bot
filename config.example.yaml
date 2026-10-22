@@ -43,6 +43,16 @@ allow_public_resolve: true
 # 私聊解析返回消息时，是否在文字末尾嵌入原消息来源链接（格式：[Source Link](url)）
 append_source_link: true
 
+# ── 克隆任务 ─────────────────────────────────────────────────────────────
+clone:
+  # 进程重启（崩溃 / 换代理重启 / 更新部署）后自动从断点继续未完成的克隆任务。
+  # 设为 false 则重启后把中断的任务置为「已暂停」，需要手动点「继续」。
+  auto_resume: true
+  # 每批拉取的消息条数（流式处理，不一次性载入整个频道；相册不会被切到两批）
+  batch_size: 200
+  # 每成功转发 N 条刷新一次进度显示（会编辑同一条消息，不会刷屏）
+  progress_notify_every: 50
+
 # ── MTProto 代理自动选优（网络无法直连 Telegram 时启用）────────────────
 # 数据来源：telegram-mtproto-proxy-list 项目每小时更新的 top40.json；
 # 本机对榜单代理做真实 FakeTLS 握手测速后选出最优，写入 data/proxy.json。
