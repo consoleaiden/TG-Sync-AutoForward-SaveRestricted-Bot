@@ -1,4 +1,9 @@
-"""Bot 命令处理器：注册所有 Telegram Bot 命令。"""
+"""Bot 命令处理器：注册所有 Telegram Bot 命令。
+
+交互有两条路径，共用同一套业务逻辑：
+1. 按钮式菜单（bot/menu.py）：向导式创建任务，推荐路径；
+2. 斜杠命令：保留给习惯命令行的用户与自动化脚本。
+"""
 import asyncio
 import html
 import logging
@@ -14,6 +19,7 @@ from bot.link_parser import (
     resolve_chat_id,
     resolve_linked_chat,
 )
+from bot.menu import MenuController
 from bot.handler_common import (
     STATUS_EMOJI,
     FetchTarget,
@@ -24,6 +30,7 @@ from bot.telegram_utils import (
     resolve_topic_name, describe_source,
     get_target_topic_id, build_source_link, truncate,
 )
+from core.clone_plan import parse_start_time, progress_bar
 from core.message_logic import (
     classify_message_kind,
     collect_album_messages,
@@ -40,10 +47,22 @@ from db import models
 
 logger = logging.getLogger("tg_forward_bot.handlers")
 
+
+class HandlerRuntime:
+    """register_handlers 的返回值：给 main.py 做启动时任务恢复。"""
+
+    def __init__(self, auto_resume, sync_tasks: dict):
+        self._auto_resume = auto_resume
+        self.sync_tasks = sync_tasks
+
+    async def auto_resume_clones(self) -> tuple[int, int]:
+        return await self._auto_resume()
+
+
 def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                       db: Database, config: dict,
                       monitor_manager: MonitorManager,
-                      userbot_manager: UserBotManager | None = None):
+                      userbot_manager: UserBotManager | None = None) -> HandlerRuntime:
     admin_ids = set(config.get("admin_ids", []))
     allow_public = config.get("allow_public_resolve", False)
     append_source_link = config.get("append_source_link", False)
@@ -345,6 +364,312 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         buttons.append([Button.inline("🗑 清空所有任务", data="clear_all")])
         return buttons
 
+    # ------------------------------------------------------------------
+    # 克隆任务：创建 / 续传 / 停止（菜单与命令共用）
+    # ------------------------------------------------------------------
+
+    def _track(task_id: int, task: asyncio.Task) -> None:
+        _sync_tasks[task_id] = task
+        task.add_done_callback(lambda _t, tid=task_id: _sync_tasks.pop(tid, None))
+
+    def _spawn_sync(task_id: int, *, source_id: int, target_chat_id: int, mode: str,
+                    source_topic_id: int | None, target_topic_id: int | None,
+                    notify_chat_id: int | None, notify_msg_id: int | None,
+                    userbot: TelegramClient | None) -> None:
+        task = asyncio.create_task(syncer.start_sync(
+            task_id, source_id, target_chat_id, mode,
+            source_topic_id=source_topic_id,
+            target_topic_id=target_topic_id,
+            notify_chat_id=notify_chat_id,
+            notify_topic_id=target_topic_id,
+            notify_reply_to_msg_id=notify_msg_id,
+            userbot=userbot))
+        _track(task_id, task)
+
+    async def _spawn_restricted(task_id: int, t: dict,
+                                userbot: TelegramClient | None = None) -> None:
+        task = asyncio.create_task(restricted_syncer.start_sync(
+            task_id, t["source_chat_id"], t["target_chat_id"],
+            source_topic_id=t["source_topic_id"],
+            target_topic_id=t["target_topic_id"],
+            notify_chat_id=t.get("notify_chat_id") or t["target_chat_id"],
+            notify_topic_id=t["target_topic_id"],
+            notify_reply_to_msg_id=t.get("notify_msg_id"),
+            userbot=userbot))
+        _track(task_id, task)
+
+    async def _create_clone_task(*, source_id: int, target_chat_id: int, mode: str,
+                                 source_topic_id: int | None = None,
+                                 target_topic_id: int | None = None,
+                                 start_msg_id: int = 0,
+                                 start_date: str | None = None,
+                                 source_title: str | None = None,
+                                 target_title: str | None = None,
+                                 notify_chat_id: int | None = None,
+                                 created_by: int | None = None,
+                                 userbot: TelegramClient | None = None,
+                                 start_desc: str = "从头开始（最早 → 最新）") -> int:
+        """建任务行 → 发启动消息（作为进度载体）→ 后台执行。"""
+        task_id = await models.create_task(
+            db, "sync", source_id, target_chat_id, mode,
+            source_topic_id=source_topic_id,
+            target_topic_id=target_topic_id,
+            start_msg_id=start_msg_id,
+            start_date=start_date,
+            source_title=source_title,
+            target_title=target_title,
+            notify_chat_id=notify_chat_id,
+            created_by=created_by)
+
+        lines = [
+            f"🚀 克隆任务 #{task_id} 已启动",
+            f"📌 源: {source_title or source_id}",
+            f"🎯 目标: {target_title or target_chat_id}",
+            f"📍 起点: {start_desc}",
+            f"📋 模式: {mode}",
+            "⏳ 正在统计待克隆消息数量…",
+        ]
+        notify_msg_id = None
+        try:
+            msg = await bot.send_message(
+                notify_chat_id or target_chat_id, "\n".join(lines),
+                reply_to=target_topic_id or None,
+                buttons=[[Button.inline("📋 详情", data=f"m:task:{task_id}"),
+                          Button.inline("⏸ 暂停", data=f"m:pause:{task_id}")]])
+            notify_msg_id = msg.id
+            await models.update_task_notify(
+                db, task_id, notify_chat_id or target_chat_id, msg.id)
+        except Exception as e:
+            logger.warning("发送任务启动消息失败（进度仅写日志）: %s", e)
+
+        _spawn_sync(
+            task_id, source_id=source_id, target_chat_id=target_chat_id, mode=mode,
+            source_topic_id=source_topic_id, target_topic_id=target_topic_id,
+            notify_chat_id=notify_chat_id or target_chat_id,
+            notify_msg_id=notify_msg_id, userbot=userbot)
+        return task_id
+
+    async def _resume_clone(task_id: int) -> tuple[bool, str | None]:
+        """从游标继续一个未完成的克隆/监控任务。"""
+        t = await models.get_task(db, task_id)
+        if not t:
+            return False, "任务不存在"
+
+        if t["type"] == "monitor":
+            ok, reason, ub = await _ensure_userbot_joined_source_for_monitor(
+                t["source_chat_id"], t["source_topic_id"])
+            if not ok:
+                return False, truncate((reason or "UserBot 未加入源").replace("\n", " "), 120)
+            await models.update_task_status(db, task_id, "running")
+            await monitor_manager.start_monitor(
+                task_id, t["source_chat_id"], t["target_chat_id"], t["mode"],
+                t["source_topic_id"], t["target_topic_id"], userbot=ub)
+            logger.info("监控任务 #%s 已恢复", task_id)
+            return True, None
+
+        if int(t.get("last_synced_msg_id") or 0) <= 0 and t["status"] == "completed":
+            return False, "该任务已完成，无需继续"
+
+        await models.update_task_status(db, task_id, "running")
+        if t["type"] == "sync_restricted":
+            await _spawn_restricted(task_id, t)
+        else:
+            _spawn_sync(
+                task_id,
+                source_id=t["source_chat_id"],
+                target_chat_id=t["target_chat_id"],
+                mode=t["mode"],
+                source_topic_id=t["source_topic_id"],
+                target_topic_id=t["target_topic_id"],
+                notify_chat_id=t.get("notify_chat_id") or t["target_chat_id"],
+                notify_msg_id=t.get("notify_msg_id"),
+                userbot=None)
+        logger.info("克隆任务 #%s 已从游标 %s 继续", task_id, t.get("last_synced_msg_id"))
+        return True, None
+
+    async def _stop_task(task_id: int) -> None:
+        t = await models.get_task(db, task_id)
+        if not t:
+            return
+        if t["status"] == "running":
+            await _stop_running_task(t)
+
+    # ------------------------------------------------------------------
+    # 菜单回调：把网络/业务细节收敛在这里，菜单只负责交互
+    # ------------------------------------------------------------------
+
+    async def _menu_is_admin(event) -> bool:
+        alert = getattr(event, "data", None) is not None
+        return await _require_admin(event, alert=alert)
+
+    async def _menu_resolve_source(event, raw: str):
+        text = (raw or "").strip()
+        if not text:
+            return None, "请发送源频道链接"
+        if text.startswith("@"):
+            text = f"https://t.me/{text[1:]}"
+
+        parsed = None
+        if re.fullmatch(r"-?\d{5,}", text):
+            source_id = int(text)
+        else:
+            link = extract_tg_link(text) or text
+            parsed = parse_link(link)
+            if not parsed:
+                return None, "无法解析该链接，请检查格式"
+            source_id = await resolve_chat_id(userbot, parsed)
+            if not source_id:
+                return None, "无法访问该频道/群组（UserBot 可能未加入）"
+
+        topic_id = parsed.topic_id if parsed else None
+        is_private = parsed.is_private if parsed else str(source_id).startswith("-100")
+
+        active_ub = userbot
+        if userbot_manager:
+            active_ub, err = await userbot_manager.resolve_accessible_userbot(source_id)
+            if not active_ub:
+                if is_private:
+                    return None, err or "所有 UserBot 均未加入该私有频道/群组"
+                active_ub = userbot
+
+        title = await _format_chat_topic_display(source_id, topic_id)
+        total = None
+        try:
+            msgs = await active_ub.get_messages(source_id, limit=1, reply_to=topic_id)
+            total = getattr(msgs, "total", None)
+        except Exception as e:
+            logger.debug("统计源消息数失败 source=%s: %s", source_id, e)
+        logger.info("菜单解析源: %s (topic=%s, total=%s)", title, topic_id, total)
+        return {
+            "chat_id": source_id, "topic_id": topic_id, "title": title,
+            "total": total, "userbot": active_ub,
+        }, None
+
+    async def _menu_resolve_target(event, raw: str):
+        text = (raw or "").strip()
+        if not text:
+            return None, "请发送目标频道链接"
+        if text.startswith("@"):
+            text = f"https://t.me/{text[1:]}"
+
+        topic_id = None
+        if re.fullmatch(r"-?\d{5,}", text):
+            chat_id = int(text)
+        else:
+            link = extract_tg_link(text) or text
+            parsed = parse_link(link)
+            if not parsed:
+                return None, "无法解析目标链接"
+            chat_id = await resolve_chat_id(bot, parsed)
+            if not chat_id:
+                chat_id = await resolve_chat_id(userbot, parsed)
+            if not chat_id:
+                return None, "无法解析目标频道（Bot 可能不在该频道中）"
+            topic_id = parsed.topic_id
+
+        try:
+            await bot.get_entity(chat_id)
+        except Exception as e:
+            return None, f"Bot 无法访问该目标频道: {e}"
+
+        title = await _format_chat_topic_display(chat_id, topic_id, prefer_bot=True)
+        return {"chat_id": chat_id, "topic_id": topic_id, "title": title}, None
+
+    async def _menu_create_task(payload: dict, event):
+        kind = payload.get("kind")
+        source_id = payload["source_chat_id"]
+        source_topic_id = payload.get("source_topic_id")
+        target_chat_id = payload["target_chat_id"]
+        target_topic_id = payload.get("target_topic_id")
+        mode = payload.get("mode") or "copy"
+        start = payload.get("start") or {}
+
+        if kind == "monitor":
+            ok, reason, ub = await _ensure_userbot_joined_source_for_monitor(
+                source_id, source_topic_id)
+            if not ok:
+                return None, truncate((reason or "UserBot 未加入源").replace("\n", " "), 150)
+            task_id = await models.create_task(
+                db, "monitor", source_id, target_chat_id, mode,
+                source_topic_id=source_topic_id,
+                target_topic_id=target_topic_id,
+                source_title=payload.get("source_title"),
+                target_title=payload.get("target_title"),
+                notify_chat_id=payload.get("chat_id"),
+                created_by=payload.get("sender_id"))
+            await monitor_manager.start_monitor(
+                task_id, source_id, target_chat_id, mode,
+                source_topic_id=source_topic_id,
+                target_topic_id=target_topic_id,
+                userbot=ub or payload.get("userbot"))
+            return task_id, None
+
+        # 「继续上次进度」= 复用原任务，不新建
+        if start.get("kind") == "resume" and start.get("task_id"):
+            prev_id = int(start["task_id"])
+            ok, err = await _resume_clone(prev_id)
+            return (prev_id, None) if ok else (None, err)
+
+        task_id = await _create_clone_task(
+            source_id=source_id,
+            target_chat_id=target_chat_id,
+            mode=mode,
+            source_topic_id=source_topic_id,
+            target_topic_id=target_topic_id,
+            start_msg_id=int(start.get("msg_id") or 0),
+            start_date=start.get("date"),
+            source_title=payload.get("source_title"),
+            target_title=payload.get("target_title"),
+            notify_chat_id=payload.get("chat_id"),
+            created_by=payload.get("sender_id"),
+            userbot=payload.get("userbot"),
+            start_desc=start.get("desc") or "从头开始（最早 → 最新）",
+        )
+        return task_id, None
+
+    async def _auto_resume_clones() -> tuple[int, int]:
+        """进程重启后恢复被中断的克隆任务（可在 config.clone.auto_resume 关闭）。"""
+        cfg = config.get("clone") or {}
+        interrupted = await models.get_interrupted_clones(db)
+        if not interrupted:
+            return 0, 0
+        if not cfg.get("auto_resume", True):
+            for t in interrupted:
+                await models.update_task_status(db, t["id"], "paused")
+            logger.info("已暂停 %d 个被中断的克隆任务（auto_resume 已关闭）", len(interrupted))
+            return 0, 0
+
+        resumed = failed = 0
+        for t in interrupted:
+            ok, err = await _resume_clone(t["id"])
+            if ok:
+                resumed += 1
+            else:
+                failed += 1
+                await models.update_task_status(db, t["id"], "paused")
+                logger.warning("克隆任务 #%s 自动续传失败（已置为暂停）: %s", t["id"], err)
+        if resumed:
+            logger.info("已自动续传 %d 个克隆任务", resumed)
+        return resumed, failed
+
+    menu = MenuController(
+        bot,
+        db=db,
+        config=config,
+        userbot=userbot,
+        is_admin=_menu_is_admin,
+        format_display=lambda chat_id, topic_id, prefer_bot=False:
+            _format_chat_topic_display(chat_id, topic_id, prefer_bot=prefer_bot),
+        resolve_source=_menu_resolve_source,
+        resolve_target=_menu_resolve_target,
+        create_task=_menu_create_task,
+        stop_task=_stop_task,
+        resume_task=_resume_clone,
+        monitor_manager=monitor_manager,
+    )
+    menu.register()
+    logger.info("按钮菜单已注册")
+
     async def _resolve_private_fetch_target(parsed: ParsedLink,
                                             source_id: int,
                                             client: TelegramClient | None = None) -> FetchTarget | None:
@@ -582,34 +907,38 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     # 命令处理器
     # ------------------------------------------------------------------
 
-    @bot.on(events.NewMessage(pattern=r"/start(?:@\w+)?$"))
+    @bot.on(events.NewMessage(pattern=r"/(?:start|menu)(?:@\w+)?$"))
     async def on_start(event):
         logger.info("收到 /start 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
-        await event.reply(
-            "🤖 Telegram 转发 Bot\n\n"
-            "功能:\n"
-            "• 私聊发链接 → 解析受限内容\n"
-            "• /sync <链接> → 同步历史消息到当前群\n"
-            "• /syncrestrictedmsg <链接> → 通过 Takeout导出数据接口 补发受限消息\n"
-            "• /takeout <链接> → 通过 Takeout导出数据接口 解析单条消息/相册\n"
-            "• /monitor <链接> → 监控新消息转发到当前群（需 UserBot 先加入源）\n"
-            "• /list → 管理所有任务\n"
-            "• /settings → 查看配置")
+        await menu.show_main_menu(event)
 
     @bot.on(events.NewMessage(pattern=r"/help(?:@\w+)?$"))
     async def on_help(event):
         await event.reply(
-            "📖 使用说明:\n\n"
-            "/sync <链接> [--forward] — 同步源历史到当前群\n"
-            "/syncrestrictedmsg <链接> — 通过 Takeout导出数据接口 补发受限消息到当前群\n"
-            "/takeout <链接> — 通过 Takeout导出数据接口 解析单条消息/相册到当前群\n"
-            "/monitor <链接> [--forward] — 监控源新消息到当前群（要求 UserBot 已加入源）\n"
-            "/list — 管理所有任务（含暂停/恢复/删除）\n"
+            "📖 使用说明（推荐直接点菜单操作）\n\n"
+            "按钮菜单：/start 或 /menu\n"
+            "• 📥 新建克隆任务 — 选源 → 选目标 → 选起点 → 开始\n"
+            "• 📋 我的任务 — 查看进度、暂停、继续、删除\n\n"
+            "命令（仍然可用）：\n"
+            "/clone [链接] — 进入克隆向导\n"
+            "/sync <链接> [--forward] [--from-id N] [--from-time 2024-01-31]\n"
+            "/syncrestrictedmsg <链接> — 通过 Takeout 补发受限消息\n"
+            "/takeout <链接> — 通过 Takeout 解析单条消息/相册\n"
+            "/monitor <链接> [--forward] — 监控源新消息\n"
+            "/list — 任务列表（含暂停/恢复/删除）\n"
             "/settings — 查看限流配置\n\n"
             "链接格式:\n"
             "• https://t.me/channel/123\n"
             "• https://t.me/c/123456/789\n"
             "• https://t.me/c/123456/3/962 (话题)")
+
+    @bot.on(events.NewMessage(pattern=r"^/clone(?:@\w+)?(?:\s+(.+))?$"))
+    async def on_clone(event):
+        """命令入口：直接进入克隆向导（可选带源链接）。"""
+        if not await _require_admin(event):
+            return
+        raw = (event.pattern_match.group(1) or "").strip()
+        await menu.start_wizard_via_command(event, "clone", raw or None)
 
     @bot.on(events.NewMessage(pattern=r"/sync(?:@\w+)?\s+"))
     async def on_sync(event):
@@ -634,36 +963,49 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 await event.reply(f"❌ {err_msg or '所有配置的 UserBot 均未加入该私有频道/群组'}")
                 return
 
-        logger.info("创建同步任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s (UserBot: %s)",
-                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode,
-                     getattr(active_ub, '_phone', 'default'))
-        task_id = await models.create_task(
-            db, "sync", source_id, target_chat_id, mode,
-            source_topic_id=parsed.topic_id,
-            target_topic_id=target_topic_id)
+        # 可选起点：--from-id N / --from-time 2024-01-31[T12:30]
+        start_msg_id, start_date, start_desc = 0, None, "从头开始（最早 → 最新）"
+        raw = event.raw_text or ""
+        m = re.search(r"--from-id\s+(\d+)", raw)
+        if m:
+            start_msg_id = int(m.group(1))
+            start_desc = f"从指定消息 {start_msg_id} 开始"
+        else:
+            m = re.search(
+                r"--from-time\s+(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?)",
+                raw)
+            if m:
+                when = parse_start_time(m.group(1))
+                if not when:
+                    await event.reply("❌ --from-time 时间格式无法识别，例如：2024-01-31 或 2024-01-31T12:30")
+                    return
+                start_date = when.isoformat()
+                start_desc = f"从 {when.strftime('%Y-%m-%d %H:%M')} 之后开始"
 
-        rl = _get_dynamic_rate_limit(config)
-        interval = rl.get("forward_interval", [2, 5])
+        logger.info("创建克隆任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s "
+                    "start_msg=%s start_date=%s (UserBot: %s)",
+                    source_id, parsed.topic_id, target_chat_id, target_topic_id, mode,
+                    start_msg_id, start_date, getattr(active_ub, '_phone', 'default'))
+
         source_desc = await _format_chat_topic_display(source_id, parsed.topic_id)
         target_desc = await _format_chat_topic_display(
             target_chat_id, target_topic_id, prefer_bot=True
         )
-        start_msg = await event.reply(
-            f"🚀 同步任务 #{task_id} 已创建\n"
-            f"📌 源: {source_desc}\n"
-            f"🎯 目标: {target_desc}\n"
-            f"⏱ 转发间隔: {interval[0]}-{interval[1]}秒/条\n"
-            f"📋 模式: {mode}")
-
-        task = asyncio.create_task(syncer.start_sync(
-            task_id, source_id, target_chat_id, mode,
+        await _create_clone_task(
+            source_id=source_id,
+            target_chat_id=target_chat_id,
+            mode=mode,
             source_topic_id=parsed.topic_id,
             target_topic_id=target_topic_id,
+            start_msg_id=start_msg_id,
+            start_date=start_date,
+            source_title=source_desc,
+            target_title=target_desc,
             notify_chat_id=event.chat_id,
-            notify_topic_id=target_topic_id,
-            notify_reply_to_msg_id=start_msg.id,
-            userbot=active_ub))
-        _sync_tasks[task_id] = task
+            created_by=event.sender_id,
+            userbot=active_ub,
+            start_desc=start_desc,
+        )
 
     @bot.on(events.NewMessage(pattern=r"/syncrestrictedmsg(?:@\w+)?\s+"))
     async def on_sync_restricted(event):
@@ -956,6 +1298,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             f"源: {src_desc}\n"
             f"目标: {tgt_desc}")
 
+        if t["type"] in models.CLONE_TASK_TYPES:
+            done = int(t.get("done_count") or 0)
+            total = int(t.get("total_count") or 0) or None
+            text += (
+                f"\n进度: {progress_bar(done, total)}"
+                f"\n游标: msg_id={int(t.get('last_synced_msg_id') or 0)}"
+                f"\n成功 {done:,} · 失败 {int(t.get('fail_count') or 0):,}"
+                f" · 跳过 {int(t.get('skip_count') or 0):,}")
+            if t.get("last_error"):
+                text += f"\n最近错误: {str(t['last_error'])[:80]}"
+
         buttons = []
         if source_link:
             buttons.append([Button.url("🔗 打开源", source_link)])
@@ -1005,57 +1358,13 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not t:
             return
 
-        if t["type"] == "monitor":
-            ok, reason = await _ensure_userbot_joined_source_for_monitor(
-                t["source_chat_id"], t["source_topic_id"]
-            )
-            if not ok:
-                alert_text = truncate(reason.replace("\n", " "), 80) if reason else "UserBot 未加入源，无法恢复"
-                await event.answer(alert_text, alert=True)
-                await _show_task_detail(event, task_id)
-                return
-
-            await models.update_task_status(db, task_id, "running")
-            await monitor_manager.start_monitor(
-                task_id, t["source_chat_id"], t["target_chat_id"],
-                t["mode"], t["source_topic_id"], t["target_topic_id"])
-
-            logger.info("监控任务 #%s 已恢复", task_id)
-            await event.answer(f"▶️ 监控任务 #{task_id} 已恢复")
-            await _show_task_detail(event, task_id)
-
-        elif t["type"] == "sync_restricted":
-            await models.update_task_status(db, task_id, "running")
-            start_msg_id = event.message_id
-            task = asyncio.create_task(restricted_syncer.start_sync(
-                task_id, t["source_chat_id"], t["target_chat_id"],
-                source_topic_id=t["source_topic_id"],
-                target_topic_id=t["target_topic_id"],
-                notify_chat_id=t["target_chat_id"],
-                notify_topic_id=t["target_topic_id"],
-            ))
-            _sync_tasks[task_id] = task
-            logger.info("受限同步任务 #%s 已恢复", task_id)
-            await event.answer(f"▶️ 受限同步任务 #{task_id} 已恢复")
-            await _show_task_detail(event, task_id)
-
-        elif t["type"] == "sync":
-            await models.update_task_status(db, task_id, "running")
-            task = asyncio.create_task(syncer.start_sync(
-                task_id, t["source_chat_id"], t["target_chat_id"],
-                t["mode"],
-                source_topic_id=t["source_topic_id"],
-                target_topic_id=t["target_topic_id"],
-                notify_chat_id=t["target_chat_id"],
-                notify_topic_id=t["target_topic_id"],
-            ))
-            _sync_tasks[task_id] = task
-            logger.info("同步任务 #%s 已恢复", task_id)
-            await event.answer(f"▶️ 同步任务 #{task_id} 已恢复")
-            await _show_task_detail(event, task_id)
-
+        ok, err = await _resume_clone(task_id)
+        if not ok:
+            await event.answer(truncate(err or "无法继续", 120), alert=True)
         else:
-            await event.answer("未知任务类型，无法恢复", alert=True)
+            await event.answer(f"▶️ 任务 #{task_id} 已继续（从游标 "
+                               f"{t.get('last_synced_msg_id') or 0} 之后）")
+        await _show_task_detail(event, task_id)
 
     @bot.on(events.CallbackQuery(pattern=rb"delete:(\d+)"))
     async def on_delete(event):
@@ -1164,3 +1473,6 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not msg:
             return
         await _forward_private_message(event, fetch_target.chat_id, msg, parsed, client=active_ub, source_url=source_url)
+
+    # main.py 通过该对象做启动时的任务恢复
+    return HandlerRuntime(_auto_resume_clones, _sync_tasks)
