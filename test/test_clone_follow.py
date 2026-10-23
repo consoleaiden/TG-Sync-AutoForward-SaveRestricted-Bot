@@ -15,9 +15,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telethon.tl import types
 
 from bot.handlers import (
+    build_message_link,
     describe_forwarded_source,
+    extract_forwarded_msg_id,
     latest_source_msg_id,
     parse_clone_args,
+    parse_kljx_args,
     register_handlers,
     strip_command,
 )
@@ -438,6 +441,170 @@ class TestChapdCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("目标频道", text)
         self.assertIn("-1000000987654", text)
         self.assertIn("/kl https://t.me/c/987654/1", text)
+
+
+class TestKljxArgs(unittest.TestCase):
+    """`/kljx <链接> [ID|区间]` 的参数解析，ID 可在链接前或后。"""
+
+    def test_rear_range(self):
+        start, end, rest, desc = parse_kljx_args("https://t.me/123456 120-1000")
+        self.assertEqual((start, end), (120, 1000))
+        self.assertEqual(rest, "https://t.me/123456")
+        self.assertIn("120", desc)
+
+    def test_front_range(self):
+        start, end, rest, _ = parse_kljx_args("120-1000 https://t.me/foo")
+        self.assertEqual((start, end), (120, 1000))
+        self.assertEqual(rest, "https://t.me/foo")
+
+    def test_rear_single(self):
+        start, end, rest, desc = parse_kljx_args("https://t.me/123456 120")
+        self.assertEqual((start, end), (120, 0))
+        self.assertEqual(rest, "https://t.me/123456")
+        self.assertIn("120", desc)
+
+    def test_front_single(self):
+        start, end, rest, _ = parse_kljx_args("120 https://t.me/foo")
+        self.assertEqual((start, end), (120, 0))
+        self.assertEqual(rest, "https://t.me/foo")
+
+    def test_no_id_link_ending_with_digits(self):
+        start, end, rest, desc = parse_kljx_args("https://t.me/123456")
+        self.assertEqual((start, end), (0, 0))
+        self.assertEqual(rest, "https://t.me/123456")
+        self.assertIsNone(desc)
+
+    def test_link_ending_digits_plus_single(self):
+        """链接末尾带数字时，尾部单个 ID 也不能被吞掉。"""
+        start, end, rest, _ = parse_kljx_args("https://t.me/c/987654 456")
+        self.assertEqual((start, end), (456, 0))
+        self.assertEqual(rest, "https://t.me/c/987654")
+
+    def test_private_link_with_range(self):
+        start, end, rest, _ = parse_kljx_args("https://t.me/c/987654/1 120-1000")
+        self.assertEqual((start, end), (120, 1000))
+        self.assertEqual(rest, "https://t.me/c/987654/1")
+
+    def test_empty(self):
+        self.assertEqual(parse_kljx_args(""), (0, 0, "", None))
+
+    def test_reversed_range(self):
+        start, end, rest, _ = parse_kljx_args("https://t.me/foo 1000-120")
+        self.assertEqual((start, end), (120, 1000))
+        self.assertEqual(rest, "https://t.me/foo")
+
+
+class TestChaidHelpers(unittest.TestCase):
+    """消息 ID / 链接提取。"""
+
+    def test_channel_post_from_fwd_header(self):
+        hdr = types.MessageFwdHeader(from_id=types.PeerChannel(987654),
+                                     channel_post=456,
+                                     date=datetime.now(timezone.utc))
+        msg = SimpleNamespace(fwd_from=hdr, forward=None)
+        self.assertEqual(extract_forwarded_msg_id(msg), 456)
+
+    def test_no_channel_post_returns_zero(self):
+        hdr = types.MessageFwdHeader(from_name="某人",
+                                     date=datetime.now(timezone.utc))
+        msg = SimpleNamespace(fwd_from=hdr, forward=None)
+        self.assertEqual(extract_forwarded_msg_id(msg), 0)
+
+    def test_build_public_link(self):
+        self.assertEqual(
+            build_message_link(-1001234, "somechannel", 789),
+            "https://t.me/somechannel/789")
+
+    def test_build_private_link(self):
+        link = build_message_link(-1000000987654, None, 456)
+        self.assertEqual(link, "https://t.me/c/987654/456")
+
+
+class TestChaidCommand(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "chaid.db"))
+        await self.db.init()
+        self.bot = FakeBot()
+        self.config = {"admin_ids": [7], "allow_public_resolve": True,
+                       "rate_limit": {"forward_interval": [0, 0]},
+                       "clone": {"auto_resume": True}}
+        self.monitor = MonitorManager(self.bot, self.bot, self.db, self.config)
+        register_handlers(self.bot, self.bot, self.db, self.config, self.monitor)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.tmp.cleanup()
+
+    def _handler(self, name):
+        for _ev, fn in self.bot.handlers:
+            if fn.__name__ == name:
+                return fn
+        self.fail(f"未注册处理器 {name}")
+
+    async def test_chaid_prompts_for_forward(self):
+        ev = FakeEvent(text="/chaid")
+        await self._handler("on_chaid")(ev)
+        self.assertTrue(any("转发" in r and "消息 ID" in r for r in ev.replies))
+
+    async def test_chaid_forward_reports_id_and_link(self):
+        await self._handler("on_chaid")(FakeEvent(text="/chaid"))
+
+        hdr = types.MessageFwdHeader(from_id=types.PeerChannel(987654),
+                                     channel_post=456,
+                                     date=datetime.now(timezone.utc))
+        msg = SimpleNamespace(fwd_from=hdr, forward=None)
+        fwd_ev = FakeEvent(text="", message=msg)
+        await self._handler("on_chaid_forward")(fwd_ev)
+
+        text = fwd_ev.replies[-1]
+        self.assertIn("消息 ID: 456", text)
+        self.assertIn("https://t.me/c/987654/456", text)
+        self.assertIn("/kljx https://t.me/c/987654/1 456", text)
+
+    async def test_chaid_forward_without_channel_post_warns(self):
+        await self._handler("on_chaid")(FakeEvent(text="/chaid"))
+
+        hdr = types.MessageFwdHeader(from_name="个人用户",
+                                     date=datetime.now(timezone.utc))
+        msg = SimpleNamespace(fwd_from=hdr, forward=None)
+        fwd_ev = FakeEvent(text="", message=msg)
+        await self._handler("on_chaid_forward")(fwd_ev)
+
+        self.assertTrue(any("没有识别到源频道的消息 ID" in r
+                            for r in fwd_ev.replies))
+
+
+class TestSetCloneResumePoint(unittest.IsolatedAsyncioTestCase):
+    """`/kljx <链接> <ID|区间>` 改写续跑点。"""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "resume.db"))
+        await self.db.init()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.tmp.cleanup()
+
+    async def test_resume_point_overrides_cursor_and_end(self):
+        tid = await models.create_task(self.db, "sync", -1001, -1002)
+        await models.update_task_status(self.db, tid, "completed")
+        await models.set_clone_resume_point(self.db, tid,
+                                            start_msg_id=120, end_msg_id=1000)
+        t = await models.get_task(self.db, tid)
+        self.assertEqual(t["status"], "running")
+        self.assertEqual(t["last_synced_msg_id"], 119)
+        self.assertEqual(t["start_msg_id"], 120)
+        self.assertEqual(t["end_msg_id"], 1000)
+
+    async def test_resume_point_start_one(self):
+        tid = await models.create_task(self.db, "sync", -1001, -1002)
+        await models.set_clone_resume_point(self.db, tid, start_msg_id=1)
+        t = await models.get_task(self.db, tid)
+        self.assertEqual(t["last_synced_msg_id"], 0)
+        self.assertEqual(t["start_msg_id"], 1)
+        self.assertEqual(t["end_msg_id"], 0)
 
 
 class FakeSourceClient:

@@ -66,17 +66,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   | `/kl <链接>` | 克隆全部到本群，完成后持续监听 |
   | `/kl 100-1100 <链接>` | 只克隆该 ID 区间（含两端） |
   | `/kljx <链接>` | 继续克隆：`find_clone_task` 找同源同目标最新记录 → `reopen_clone_task` → 从游标续跑，不重复；先比对源最新消息（`latest_source_msg_id`），已追平就回「已是最新」不空跑，查不到才按无法判断处理（不会误判成已追平） |
+  | `/kljx <链接> 120` / `120-1000` | 显式改写续跑点：`set_clone_resume_point` 把游标设为 `ID-1`、`start_msg_id=ID`（区间再设 `end_msg_id`），跳过「已是最新」判断从该条重克隆（`parse_kljx_args` 支持 ID 写在链接前或后） |
   | `/jt <链接>` | 只监听新消息，先校验 UserBot 已加入源 |
   | `/kllb` | 克隆任务列表 |
   | `/jtlb` | 监听任务列表 |
   | `/chapd` | 等一条转发的频道消息，返回频道名 / @用户名 / ID / 链接与现成命令（10 分钟 TTL，`describe_forwarded_source`） |
+  | `/chaid` | 等一条转发的频道消息，返回源频道里的**消息 ID**（`fwd_from.channel_post`）与 `t.me` 消息链接（`extract_forwarded_msg_id` + `build_message_link`），并附现成的 `/kljx <链接> <ID>` 命令；转发个人消息/复制文本时给出明确告警 |
 - `bot/menu.py`：主菜单改为「👁 新建持续监听 / 📥 新建克隆任务 / 📋 克隆任务列表 /
   📡 监听任务列表 / ⚙️ 限流设置 / ❓ 命令与说明」；列表标题显示「运行中 N · 持续监听 M」，
   持续监听的任务行带 `🛰` 标记；已完成克隆在详情页提供「🔁 继续补新消息」（`cont:<id>`）。
 - `config.example.yaml`：新增 `clone.follow_after_finish: true`。
-- `test/test_clone_follow.py`（26 个用例）：命令参数解析、转发来源识别、新列与老库迁移、
-  已完成记录可查与 `reopen_clone_task`、区间克隆的 `max_id` 边界、详情页按钮与 `follow:`/`cont:` 分发、
-  `/chapd` 提示与识别结果、`latest_source_msg_id` 的多客户端回退与"查不到返回 None"。
+- `test/test_clone_follow.py`（44 个用例）：命令参数解析（含 `parse_kljx_args` 的
+  ID 前后置与"链接以数字结尾"边界）、转发来源识别、消息 ID/链接提取（`/chaid`）、
+  新列与老库迁移、已完成记录可查与 `reopen_clone_task`/`set_clone_resume_point`、
+  区间克隆的 `max_id` 边界、详情页按钮与 `follow:`/`cont:` 分发、
+  `/chapd` `/chaid` 提示与识别结果、`latest_source_msg_id` 的多客户端回退与"查不到返回 None"。
 
 ### Fixed
 - **「实时监控新消息」建了却不生效、且没有任何提示**：

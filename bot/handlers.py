@@ -50,6 +50,12 @@ logger = logging.getLogger("tg_forward_bot.handlers")
 
 # `/kl 100-1100 <链接>` 的 ID 区间（支持 - ~ — 到 至）
 _RANGE_RE = re.compile(r"^(\d{1,12})\s*(?:-|~|—|到|至)\s*(\d{1,12})(?!\d)")
+# 尾部区间：`/kljx <链接> 120-1000`（要求数字前有空白，避免吃掉链接里的数字）
+_RANGE_RE_TAIL = re.compile(
+    r"\s(\d{1,12})\s*(?:-|~|—|到|至)\s*(\d{1,12})(?!\d)\s*$")
+# 单个起始 ID：`/kljx 120 <链接>`（前）或 `/kljx <链接> 120`（后）
+_SINGLE_ID_HEAD = re.compile(r"^(\d{1,12})(?!\d)\s+")
+_SINGLE_ID_TAIL = re.compile(r"\s(\d{1,12})(?!\d)\s*$")
 # /chapd 的「等一条转发消息」有效期
 CHAPD_TTL = 10 * 60
 
@@ -67,6 +73,49 @@ def parse_clone_args(raw: str) -> tuple[int, int, str, str | None]:
         desc = f"从消息 {start} 到 {end}"
         text = text[m.end():].strip()
     return start, end, text, desc
+
+
+def parse_kljx_args(raw: str) -> tuple[int, int, str, str | None]:
+    """解析 `/kljx <链接> [起始ID|起始ID-结束ID]`，ID 可写在链接前或后。
+
+    返回 (起始ID, 结束ID, 剩余文本(链接), 描述)；没有 ID 时起止均为 0。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return 0, 0, "", None
+
+    # 1. 前置区间：`120-1000 <链接>`
+    m = _RANGE_RE.match(text)
+    if m:
+        start, end, desc = _norm_range(m.group(1), m.group(2))
+        return start, end, text[m.end():].strip(), desc
+
+    # 2. 后置区间：`<链接> 120-1000`
+    m = _RANGE_RE_TAIL.search(text)
+    if m and m.start() > 0:
+        start, end, desc = _norm_range(m.group(1), m.group(2))
+        return start, end, text[:m.start()].strip(), desc
+
+    # 3. 前置单个 ID：`120 <链接>`
+    m = _SINGLE_ID_HEAD.match(text)
+    if m and text[m.end():].strip():
+        start = int(m.group(1))
+        return start, 0, text[m.end():].strip(), f"从消息 {start} 开始"
+
+    # 4. 后置单个 ID：`<链接> 120`
+    m = _SINGLE_ID_TAIL.search(text)
+    if m and m.start() > 0:
+        start = int(m.group(1))
+        return start, 0, text[:m.start()].strip(), f"从消息 {start} 开始"
+
+    return 0, 0, text, None
+
+
+def _norm_range(a: str, b: str) -> tuple[int, int, str]:
+    start, end = int(a), int(b)
+    if start > end:
+        start, end = end, start
+    return start, end, f"从消息 {start} 到 {end}"
 
 
 def strip_command(raw: str, name: str) -> str:
@@ -109,6 +158,37 @@ def describe_forwarded_source(msg) -> dict | None:
         link = f"https://t.me/c/{real_id}/1"
     return {"chat_id": int(chat_id), "title": title,
             "username": username, "link": link}
+
+
+def extract_forwarded_msg_id(msg) -> int:
+    """从转发消息里取源频道中的**原始消息 ID**（不是转发副本的 ID）。
+
+    频道消息转发时 `fwd_from.channel_post` 记录原 ID；个别客户端走
+    `forward.channel_post`；从"已保存的消息"转发则只有 `saved_from_msg_id`。
+    都没有（例如转发自个人）时返回 0。
+    """
+    hdr = getattr(msg, "fwd_from", None)
+    fwd = getattr(msg, "forward", None)
+    candidates = (
+        getattr(hdr, "channel_post", None),
+        getattr(fwd, "channel_post", None) if fwd is not None else None,
+        getattr(hdr, "saved_from_msg_id", None),
+    )
+    for val in candidates:
+        if val:
+            return int(val)
+    return 0
+
+
+def build_message_link(chat_id: int, username: str | None, msg_id: int) -> str:
+    """拼一条直达消息的 t.me 链接：公开频道用用户名，私有频道用 t.me/c/<真实ID>。"""
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    try:
+        real_id = utils.resolve_id(int(chat_id))[0]
+    except Exception:
+        real_id = abs(int(chat_id))
+    return f"https://t.me/c/{real_id}/{msg_id}"
 
 
 
@@ -1233,13 +1313,16 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "📖 命令与功能对照\n\n"
             "【克隆 / 监听】\n"
             "/kl <链接> — 克隆该频道全部消息到本群，完成后自动持续监听\n"
-            "/kl 100-1100 <链接> — 只克隆 msg 100~1100（含两端）\n"
+            "/kl 100-1100 <链接> — 只克隆 msg 100~1100（含两端，区间也可写在链接后）\n"
             "/kljx <链接> — 接着上次进度补到最新，已克隆过的不会重复\n"
+            "/kljx <链接> 120 — 从消息 120 开始继续克隆到最新\n"
+            "/kljx <链接> 120-1000 — 只克隆 msg 120~1000\n"
             "/jt <链接> — 只监听新消息（不克隆历史）\n"
             "/kllb — 克隆任务列表（含已完成，记录永久保留）\n"
             "/jtlb — 监听任务列表\n\n"
             "【工具】\n"
             "/chapd — 转发一条频道消息到本群，识别来源频道名称/ID/链接\n"
+            "/chaid — 转发一条频道消息到本群，返回消息 ID 和消息链接（配 /kljx 用）\n"
             "/start 或 /menu — 按钮菜单（推荐，含进度、暂停、继续、开关持续监听）\n"
             "/settings — 查看限流与数据存储状态\n"
             "/help — 本说明\n\n"
@@ -1269,6 +1352,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     # ------------------------------------------------------------------
 
     _chapd_wait: dict[tuple[int, int], float] = {}
+    # /chaid：等一条转发消息，用于获取源频道的「消息 ID + 消息链接」
+    _chaid_wait: dict[tuple[int, int], float] = {}
 
     async def _resolve_cmd_source(event, raw: str):
         """命令里解析源：复用菜单的解析逻辑，错误直接回复用户。"""
@@ -1297,13 +1382,15 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not await _require_admin(event):
             return
         raw = strip_command(event.raw_text, "kl")
-        start_id, end_id, rest, range_desc = parse_clone_args(raw)
+        start_id, end_id, rest, range_desc = parse_kljx_args(raw)
         if not rest:
             await event.reply(
                 "用法：\n"
                 "• `/kl https://t.me/xxx` — 克隆该频道全部消息，完成后持续监听\n"
                 "• `/kl 100-1100 https://t.me/xxx` — 只克隆 msg 100~1100\n"
-                "• `/kljx https://t.me/xxx` — 接着上次进度补到最新（不重复）")
+                "• `/kl https://t.me/xxx 100-1100` — 区间写在链接后也可以\n"
+                "• `/kljx https://t.me/xxx` — 接着上次进度补到最新（不重复）\n"
+                "• `/kljx https://t.me/xxx 120` — 从消息 120 开始继续克隆")
             return
 
         info = await _resolve_cmd_source(event, rest)
@@ -1398,14 +1485,29 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.NewMessage(pattern=r"^/kljx(?:@\w+)?(?=\s|$)"))
     async def on_kl_continue(event):
-        """`/kljx <链接>` 从上次游标继续补到最新，已克隆过的不会重复。"""
+        """`/kljx <链接> [ID|区间]` 继续克隆。
+
+        不带 ID：从上次游标补到最新，已克隆过的不会重复；
+        带 ID（如 `/kljx <链接> 120`）：把续跑点改到消息 120，从那里克隆到最新
+        （用于游标之后漏了消息、需要手动指定起点重补的场景）；
+        带区间（如 `/kljx <链接> 120-1000`）：从 120 克隆到 1000。
+        """
         if not await _require_admin(event):
             return
         raw = strip_command(event.raw_text, "kljx")
         if not raw:
-            await event.reply("用法：`/kljx https://t.me/xxx` — 接着上次进度继续克隆到最新")
+            await event.reply(
+                "用法：\n"
+                "• `/kljx https://t.me/xxx` — 接着上次进度继续克隆到最新\n"
+                "• `/kljx https://t.me/xxx 120` — 从消息 120 开始克隆到最新\n"
+                "• `/kljx https://t.me/xxx 120-1000` — 只克隆 msg 120~1000\n"
+                "（起始 ID 可用 `/chaid` 转发一条消息自动获取）")
             return
-        info = await _resolve_cmd_source(event, raw)
+        start_id, end_id, rest, range_desc = parse_kljx_args(raw)
+        if not rest:
+            await event.reply("❌ 没有识别到频道链接，请检查格式：`/kljx https://t.me/xxx 120`")
+            return
+        info = await _resolve_cmd_source(event, rest)
         if not info:
             return
 
@@ -1422,6 +1524,26 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         cursor = int(found.get("last_synced_msg_id") or 0)
         follow = int(found.get("follow") or 0)
+
+        # 带起始 ID：显式改写续跑点，跳过「已是最新」判断（用户就是要从那里重来）
+        if start_id > 0:
+            if end_id and end_id < start_id:
+                start_id, end_id = end_id, start_id
+            await models.set_clone_resume_point(
+                db, found["id"], start_msg_id=start_id, end_msg_id=end_id)
+            ok, err = await _resume_clone(found["id"], allow_completed=True)
+            if not ok:
+                await models.update_task_status(db, found["id"], "paused")
+                await event.reply(f"❌ 继续克隆失败：{err or '未知原因'}")
+                return
+            range_line = (f"到消息 {end_id}" if end_id else "到最新消息")
+            await event.reply(
+                f"🔁 已从消息 {start_id} 开始继续：任务 #{found['id']}\n"
+                f"• 范围: msg {start_id} → {range_line}\n"
+                f"• 原游标 msg_id={cursor} 已被改写；这段若克隆过会**重复发送**\n"
+                f"• {'补完后自动持续监听' if follow else '需要持续跟新可在任务详情里开启 🛰 持续监听'}",
+                buttons=[[Button.inline("📋 任务详情", data=f"m:task:{found['id']}")]])
+            return
 
         # 先看一眼源的最新消息：已经追平就不用空跑一遍
         latest = await _latest_source_msg_id(
@@ -1489,6 +1611,46 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             f"`/kljx {info['link']}` — 只补新消息\n"
             f"`/jt {info['link']}` — 只监听新消息\n"
             f"`/kl {info['chat_id']}` — 用频道 ID 直接克隆")
+
+    @bot.on(events.NewMessage(pattern=r"^/chaid(?:@\w+)?$"))
+    async def on_chaid(event):
+        """进入「等一条转发消息」状态，返回该消息的链接与 ID，配合 /kljx 用。"""
+        if not await _require_admin(event):
+            return
+        _chaid_wait[(event.chat_id, event.sender_id)] = time.time()
+        await event.reply(
+            "📎 请把目标频道里的**任意一条消息转发**到本群（用「转发」，不要复制文本）。\n"
+            "我会返回这条消息在源频道里的**消息 ID** 和**消息链接**，可直接用于：\n"
+            "`/kljx <链接> <消息ID>` — 从这条开始继续克隆\n"
+            f"（{CHAPD_TTL // 60} 分钟内有效）")
+
+    @bot.on(events.NewMessage(func=lambda e: (
+        getattr(e.message, "fwd_from", None) is not None
+        and (_chaid_wait.get((e.chat_id, e.sender_id)) or 0) > time.time() - CHAPD_TTL
+    )))
+    async def on_chaid_forward(event):
+        if not await _require_admin(event):
+            return
+        _chaid_wait.pop((event.chat_id, event.sender_id), None)
+        msg = event.message
+        info = describe_forwarded_source(msg)
+        post_id = extract_forwarded_msg_id(msg)
+        if not info or not post_id:
+            await event.reply(
+                "⚠️ 没有识别到源频道的消息 ID。\n"
+                "请直接在频道里对某条消息按「转发」→ 选本群（转发个人消息或复制文本\n"
+                "都拿不到频道消息 ID），再发送一次 /chaid 重试。")
+            return
+        msg_link = build_message_link(info["chat_id"], info["username"], post_id)
+        await event.reply(
+            "📎 已识别源消息\n"
+            f"• 频道: {info['title']}\n"
+            f"• 消息 ID: {post_id}\n"
+            f"• 消息链接: {msg_link}\n\n"
+            "可直接复制下面的命令：\n"
+            f"`/kljx {info['link']} {post_id}` — 从这条开始继续克隆到最新\n"
+            f"`/kl {info['link']} {post_id}-{post_id}` — 只克隆这一条\n"
+            f"`/kljx {info['link']} {post_id}-999999` — 从这条克隆到接近最新")
 
     @bot.on(events.NewMessage(pattern=r"/sync(?:@\w+)?\s+"))
     async def on_sync(event):

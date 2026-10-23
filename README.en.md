@@ -18,7 +18,7 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 - **Historical Sync** — `/sync` pulls past messages with resumable progress tracking; restricted messages are automatically forwarded via Takeout inline
 - **Restricted Message Sync** — `/syncrestrictedmsg` re-exports only platform-restricted messages using Telegram's Takeout API
 - **Real-Time Monitoring** — `/jt` or the menu watches for new messages and forwards them automatically; the monitor list shows each task's source, target and forwarded count, and duplicate monitors are rejected
-- **Source Identification** — Run `/chapd`, then forward any message from the channel into the chat; the bot returns the channel title, @username, ID, a usable link and ready-to-copy commands
+- **Source Identification** — Run `/chapd`, then forward any message from the channel into the chat; the bot returns the channel title, @username, ID, a usable link and ready-to-copy commands. `/chaid` returns the **message ID and message link** instead, pairing with `/kljx <link> <start|range>`
 - **Graceful Degradation** — Bot direct → UserBot direct forward (server-side, no download) → UserBot read + Bot write → download & re-upload → failure marker `#fail2forward`
 - **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
 - **Hard-Block Filtering** — Automatically skips globally restricted content (`platform=all`); platform-specific restrictions are still forwarded
@@ -90,10 +90,13 @@ python main.py
 | `/kl <link>`                   | Clone all messages to this chat, then keep following new messages automatically   |
 | `/kl <start>-<end> <link>`     | Clone only a message ID range (inclusive), e.g. `/kl 100-1100 https://t.me/xxx`   |
 | `/kljx <link>`                 | Continue cloning from the saved cursor up to the newest; nothing is duplicated    |
+| `/kljx <link> 120`             | Continue cloning starting at message 120 (get the ID via `/chaid`)                |
+| `/kljx <link> 120-1000`        | Clone only msg 120–1000 (the range may also precede the link)                     |
 | `/jt <link>`                   | Follow new messages only (no history backfill)                                    |
 | `/kllb`                        | Clone task list (includes completed tasks — records are kept forever)             |
 | `/jtlb`                        | Monitor task list (includes follow-ups created from clone tasks)                  |
 | `/chapd`                       | Prompts you to forward a channel message here to identify title / @username / ID  |
+| `/chaid`                       | Prompts you to forward a channel message here to get its **ID** and **link**      |
 | `/help`                        | Show every command with its purpose                                               |
 | `/start` · `/menu`             | Button menu: wizard, progress, pause/resume, toggle follow                        |
 | `/settings`                    | Rate-limit configuration and storage status                                       |

@@ -193,6 +193,23 @@ async def reopen_clone_task(db: Database, task_id: int,
     await db.db.commit()
 
 
+async def set_clone_resume_point(db: Database, task_id: int,
+                                 *, start_msg_id: int,
+                                 end_msg_id: int = 0) -> None:
+    """把克隆任务的续跑点改到指定消息 ID（供 `/kljx <链接> <ID|区间>` 使用）。
+
+    `build_plan` 里 `last_synced_msg_id > 0` 优先于 `start_msg_id`，因此这里把
+    游标直接设为 `start_msg_id - 1`（reverse 模式取 > offset_id，正好从该条开始）；
+    start=1 时游标归 0，由 `start_msg_id` 分支接管，行为一致。
+    """
+    await db.db.execute(
+        "UPDATE tasks SET last_synced_msg_id=?, start_msg_id=?, end_msg_id=?,"
+        " status='running', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (max(0, int(start_msg_id) - 1), int(start_msg_id), int(end_msg_id or 0),
+         task_id))
+    await db.db.commit()
+
+
 async def get_task(db: Database, task_id: int) -> dict | None:
     cursor = await db.db.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
     row = await cursor.fetchone()
