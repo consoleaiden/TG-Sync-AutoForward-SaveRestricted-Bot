@@ -25,6 +25,11 @@ rate_limit:
   batch_pause_time: [30, 60] # 休息时间范围（秒）
   flood_wait_multiplier: 2 # FloodWait后间隔翻倍系数
   max_flood_wait: 300 # 最大等待时间（秒），超过则暂停并通知
+  # ↓ 仅作用于「UserBot 直接转发」这条策略。用户账号被风控的代价远高于 Bot，
+  #   所以节奏比上面更慢；命中 UserBot 路径时不再额外叠加 forward_interval。
+  userbot_forward_interval: [3, 6] # 每条间隔（秒）
+  userbot_forward_pause_every: 25 # 每 N 条长歇一次
+  userbot_forward_pause_time: [60, 120] # 长歇时长（秒）
 
 # 传输性能调优（下载+上传链路）
 transfer:
@@ -36,6 +41,13 @@ transfer:
   album_download_concurrency: 3 # 相册并发下载数（建议 2-4）
   upload_part_size_kb: 512 # 上传分片大小，范围 32-512
   download_part_size_kb: 512 # 下载分片大小，范围 32-512（部分 Telethon 版本可能忽略）
+  # ↓ 统一降级策略：Bot直接(V) → UserBot转发 → UserBot读+Bot写 → 下载+上传
+  #   UserBot 转发是服务端搬运，不需要下载；要求 UserBot 既能读源、又能往目标发言。
+  userbot_forward: true # 关掉则退回「UserBot 读 + Bot 写」起步（私有频道会变慢）
+  userbot_copy_fallback: true # UserBot 无法直发目标时，允许「UserBot 读 + Bot 写」兜底
+  userbot_max_flood: 3 # 连续 N 次 UserBot FloodWait 后，本次运行停用 UserBot 转发
+  userbot_flood_buffer: 5 # UserBot 遇 FloodWait 时额外多等的秒数（别贴着红线跑）
+  probe_ttl_seconds: 1800 # 「Bot 读不到源 / UserBot 不能发目标」判定的缓存时长
 
 # 是否允许非管理员使用链接解析
 allow_public_resolve: true

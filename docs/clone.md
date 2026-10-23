@@ -164,7 +164,88 @@
 
 ---
 
-## 7. 大频道不再撑爆内存
+## 7. 转发策略：私有频道不再下载
+
+公共频道和私有频道走**同一套降级顺序**，只有上一层做不到才往下掉：
+
+```
+① Bot 直接克隆       Bot 原生转发 / drop_author 无痕转发 / 用 Bot 取到的媒体引用发送
+        ↓ Bot 读不到源（典型：私有频道没把 Bot 拉进去）
+② UserBot 转发       UserBot.forward_messages（copy 模式 drop_author=True）
+        ↓ UserBot 不在目标 / 没有发帖权限
+②b UserBot 读+Bot写  用 UserBot 取到的消息交给 Bot 发送（仍不下载）
+        ↓ 源禁止转发 / 媒体引用失效 / Bot 也发不出去
+③ 下载 + 上传        UserBot 下载到临时目录，Bot 重新上传
+        ↓ 全部失败
+④ #fail2forward     发一条带源链接的失败标记
+```
+
+**为什么私有频道原来慢**：Bot 不在私有频道里，策略①必然失败；原来的第二层是
+「UserBot 读 + Bot 写」，而 Bot 拿 UserBot 取到的媒体引用去发送，私有源上常被判无效，
+于是几乎每条都掉到第③层——下载再上传，速度完全由文件体积决定。
+
+**现在**：只要 UserBot 在源频道里、并且是目标频道的管理员（有发帖权限），
+第②层就能命中。`forward_messages` 是**服务端搬运**，字节不经过你的机器：
+
+| | 下载+上传 | UserBot 转发 |
+| --- | --- | --- |
+| 1GB 视频耗时 | 取决于家宽上行，通常几分钟到几十分钟 | 一次 RPC，通常 < 1 秒 |
+| 磁盘占用 | 需要一个文件的临时空间 | 无 |
+| 单文件上限 | 受 Bot 上传上限（2GB/4GB）限制 | 不受上传上限影响（转发不是上传） |
+| 画质 | 重新编码封装参数，可能丢流 | 原样搬运 |
+
+**代价与注意**：
+
+- **发帖人变了**：`copy` 模式在第①层是 Bot 发帖，在第②层是 **UserBot** 发帖
+  （`drop_author` 只去掉「转发自」，发送者仍是 UserBot）。要求署名必须是 Bot 时，
+  把 `transfer.userbot_forward` 设为 `false`；
+- **UserBot 必须能读源**：`/jt`、`/kl` 建任务前已校验 UserBot 是否已加入源；
+- **目标侧权限**：UserBot 需要在目标频道是管理员且有「发布消息」权限，否则自动落到②b；
+- **风控**：UserBot 是用户账号，详见下一节。
+
+### 能力缓存（提速的另一个大头）
+
+「Bot 读不到这个源」「UserBot 发不进这个目标」判定一次就记住，有效期
+`transfer.probe_ttl_seconds`（默认 1800 秒），期间不再重复触发注定失败的权限错误。
+以前每条消息都要先撞一次 `ChannelPrivateError` / `ValueError`，几千条就是几千次
+无效 RPC，既慢又难看（日志里一片"异常"）。
+
+Bot 被重新拉进源频道后，最多等缓存过期（或重启进程）即可恢复第①层。
+
+---
+
+## 8. 风控：怎么把 UserBot 的风险压到最低
+
+UserBot 走的是**用户账号**，被限流/限制的代价远高于 Bot（Bot 被限流只是慢，
+用户账号被限制可能连群都发不了言，极端情况会被强制下线）。因此：
+
+| 措施 | 默认值 | 说明 |
+| --- | --- | --- |
+| 独立节奏 | `userbot_forward_interval: [3, 6]` | 命中 UserBot 路径时**替换**通用 `forward_interval`，不叠加 |
+| 批次长歇 | 每 25 条歇 `[60, 120]` 秒 | 用户账号最忌长时间匀速搬运 |
+| FloodWait 缓冲 | `+5` 秒 | 官方要求等 N 秒，这里等 N+5，不贴红线 |
+| 连续熔断 | `userbot_max_flood: 3` | 连续 3 次 FloodWait 后**本次运行停用**第②层，改走 Bot/下载；重启或换账号后恢复 |
+| 尊重 noforwards | 自动 | 源开了「禁止转发」就不去试，避免反复被拒 |
+| 去重 | `message_map` | 同一条消息不会因为重试被转两次（重复搬运是最典型的垃圾行为特征） |
+
+**建议**：
+
+1. **别把 UserBot 只当搬运工**——它同时在被克隆频道里，日常也有活动，属于"正常账号行为"；
+2. **目标频道给 UserBot 管理员权限**，而不是让它用"转发到已保存"绕路；
+3. **一次只跑一个克隆任务**，多个任务并发抢同一个 UserBot 是最容易触发限流的用法；
+4. **想更保守**：`userbot_forward_interval: [8, 15]`、`userbot_forward_pause_every: 15`；
+5. **完全不想动 UserBot**：`transfer.userbot_forward: false`，退回②b（Bot 发帖）→ ③。
+
+**适用条件（第②层能命中的前提）**：
+
+- UserBot 是源频道的成员（能读）；
+- UserBot 是目标频道的管理员且有发帖权限；
+- 源没有开启 `noforwards`（受限内容 Telegram 会直接拒绝转发，只能下载重传）；
+- 目标不是「UserBot 被禁言/限制」的群。
+
+---
+
+## 9. 大频道不再撑爆内存
 
 旧实现会先把整频道消息全读进内存再逐条转发，几万条就危险。现在按
 `clone.batch_size`（默认 200）**流式分批**：
@@ -176,7 +257,7 @@
 
 ---
 
-## 8. 配置
+## 10. 配置
 
 ```yaml
 clone:
@@ -184,6 +265,18 @@ clone:
   batch_size: 200            # 每批拉取条数
   progress_notify_every: 50  # 每 N 条刷新一次进度
   follow_after_finish: true  # 克隆跑完自动转持续监听
+
+transfer:
+  userbot_forward: true         # 允许 UserBot 直接转发（策略②）
+  userbot_copy_fallback: true   # UserBot 进不了目标时退回「UserBot 读 + Bot 写」（策略②b）
+  userbot_max_flood: 3          # 连续 N 次 UserBot FloodWait 后本次运行停用策略②
+  userbot_flood_buffer: 5       # FloodWait 额外多等的秒数
+  probe_ttl_seconds: 1800       # 「Bot 读不到源 / UserBot 不能发目标」判定缓存时长
+
+rate_limit:
+  userbot_forward_interval: [3, 6]     # UserBot 每条的间隔（替换通用间隔）
+  userbot_forward_pause_every: 25      # 每 N 条长歇
+  userbot_forward_pause_time: [60, 120]
 ```
 
 升级到本版本后首次启动会自动给 `tasks` 表补齐新增列（`PRAGMA table_info`
@@ -192,7 +285,7 @@ clone:
 
 ---
 
-## 9. 常见问题
+## 11. 常见问题
 
 **Q：点了「继续」但没有任何反应？**
 看日志有没有 `克隆任务 #N 已从游标 X 继续`。若源已不可读（UserBot 被踢、
@@ -227,3 +320,19 @@ clone:
 **Q：克隆到一半想改目标？**
 不支持改已有任务的目标。建议删掉任务，用「继续上次进度」以外的方式新建一个
 （游标是按任务记录的，新任务会从你选的起点开始）。
+
+**Q：私有频道还是在下载，没走 UserBot 转发？**
+按顺序查日志：
+1. `策略2: ... 跳过（该目标已被判定 UserBot 无发言权）` → UserBot 不是目标管理员，或没有发帖权限；
+2. `策略2: ... 跳过（源禁止转发(noforwards)）` → 源开了「禁止转发」，只能下载重传；
+3. `跳过（transfer.userbot_forward=false）` → 配置里关掉了；
+4. `UserBot FloodWait 已超 3 次` → 本次运行熔断，重启进程/换账号后恢复；
+5. `无法解析源实体` → 该 UserBot 根本没加入源频道。
+
+**Q：为什么目标频道里的帖子是 UserBot 发的，不是 Bot？**
+这就是策略②的效果：`drop_author` 只去掉「转发自 X」，发送者仍是执行转发的账号。
+要让 Bot 发帖，设 `transfer.userbot_forward: false`（会退回「UserBot 读 + Bot 写」，
+私有源上仍可能落到下载重传）。
+
+**Q：刚把 Bot 加进源频道了，为什么还走 UserBot？**
+能力判定有缓存（`transfer.probe_ttl_seconds`，默认 30 分钟）。等缓存过期或重启进程即可。

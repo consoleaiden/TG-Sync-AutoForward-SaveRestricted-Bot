@@ -19,7 +19,7 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 - **Restricted Message Sync** — `/syncrestrictedmsg` re-exports only platform-restricted messages using Telegram's Takeout API
 - **Real-Time Monitoring** — `/jt` or the menu watches for new messages and forwards them automatically; the monitor list shows each task's source, target and forwarded count, and duplicate monitors are rejected
 - **Source Identification** — Run `/chapd`, then forward any message from the channel into the chat; the bot returns the channel title, @username, ID, a usable link and ready-to-copy commands
-- **Graceful Degradation** — Bot direct → UserBot-assisted → download & re-upload → failure marker `#fail2forward`
+- **Graceful Degradation** — Bot direct → UserBot direct forward (server-side, no download) → UserBot read + Bot write → download & re-upload → failure marker `#fail2forward`
 - **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
 - **Hard-Block Filtering** — Automatically skips globally restricted content (`platform=all`); platform-specific restrictions are still forwarded
 - **Dual Mode** — Supports both `copy` (default) and `forward` transfer modes
@@ -33,7 +33,9 @@ See [docs/clone.md](docs/clone.md) for the cloning guide (start points, progress
 | **Bot**     | Command handling, target-side delivery (write)  |
 | **UserBot** | Restricted-source access, media download (read) |
 
-Design principle: **UserBot reads, Bot writes** — UserBot only participates in write operations when necessary.
+Design principle: **UserBot reads, Bot writes** — except when Bot cannot read the source at
+all (a private channel Bot was never added to); then the UserBot forwards directly, which is a
+server-side move with no download (see [Forwarding Strategy](#forwarding-strategy)).
 
 ## Prerequisites
 
@@ -122,14 +124,33 @@ Sending a `t.me/...` link in a private chat with the bot triggers parsing and fo
 
 ## Forwarding Strategy
 
-The runtime always attempts strategies in order, falling back automatically on failure:
+Public and private channels share **one degradation order** — it only drops a tier when the
+cheaper one is not possible:
 
-1. **Bot Direct** — Lowest cost; preferred when Bot can read the source
-2. **UserBot-Assisted** — UserBot reads the source, Bot delivers
-3. **Download & Re-upload** — UserBot downloads media, Bot re-uploads (used when content is protected or forwarding is restricted)
-4. **Failure Marker** — Sends `#fail2forward` when all strategies are exhausted
+| Tier | What happens | Cost | Requires |
+| --- | --- | --- | --- |
+| **1. Bot direct** | Native forward / `drop_author` forward / send via the media reference Bot fetched | one server-side op, no local bytes | Bot can read source and post to target |
+| **2. UserBot forward** | UserBot calls `forward_messages` (`drop_author` in copy mode) | one server-side op, no local bytes | Bot cannot read source, but UserBot is a member of both source and target |
+| **2b. UserBot read + Bot write** | UserBot fetches the message, Bot posts it | no download, one Bot write | UserBot can read source but cannot post to target |
+| **3. Download & re-upload** | UserBot downloads, Bot re-uploads | slowest, disk + bandwidth bound | source is `noforwards` / media reference expired |
+| **4. Failure marker** | Posts `#fail2forward` with the source link | — | everything else failed |
 
-> **Note:** "Strategy 1 succeeded" in logs means the first-tier attempt succeeded — in `copy` mode this may internally use `send_message` / `send_file`. Comment links (`?comment=`) point to the linked discussion group, which may be private even if the original post is public.
+> **Private channels no longer download by default.** If the UserBot is inside the source
+> and has posting rights in the target, tier 2 handles it: Telegram moves the message
+> server-side, so throughput depends on RTT rather than file size — and files above the
+> upload limit go through fine.
+>
+> **Sender identity changes:** in `copy` mode tier 1 posts as the **Bot**, tier 2 posts as the
+> **UserBot** (`drop_author` hides "forwarded from", but the sender is the UserBot). Set
+> `transfer.userbot_forward: false` if posts must be authored by the Bot.
+>
+> **Capability cache:** "Bot cannot read this source" and "UserBot cannot post to this target"
+> are learned once and reused for `transfer.probe_ttl_seconds` (default 30 min), so the clone
+> stops hammering doomed permission errors — that alone is a large speed-up for private sources.
+>
+> **Note:** "Strategy 1 succeeded" in logs means the first tier succeeded — in `copy` mode this
+> may internally use `send_message` / `send_file`. Comment links (`?comment=`) point to the
+> linked discussion group, which may be private even if the original post is public.
 
 ## Docker Deployment
 

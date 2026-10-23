@@ -1,8 +1,27 @@
-"""转发引擎：智能降级策略，选择最小成本的转发方式。"""
+"""转发引擎：统一降级策略，按成本从低到高选择转发方式。
+
+策略链（公共/私有频道同一套顺序，能力不足时逐级降级）：
+
+1. **策略1 Bot 直接克隆** —— Bot 自己能读源、能在目标发言：原生转发（forward）
+   或 `drop_author` 无痕转发（copy），必要时用 Bot 读到的媒体引用直接发送。
+   全程服务端操作，不落地、不解码。
+2. **策略2 UserBot 转发** —— Bot 读不到源（典型是「私有频道 + Bot 不在里面」）
+   但 UserBot 在源里、且**在目标里有发言权**时，由 UserBot 直接 `forward_messages`。
+   同样是一次服务端操作，不需要下载/上传；copy 模式用 `drop_author=True` 去掉来源标记。
+3. **策略2b UserBot 读 + Bot 写** —— UserBot 能读但**不能往目标发**（例如只是目标
+   频道管理员之外的身份）时，用 UserBot 取到的消息交给 Bot 发送，仍不下载。
+4. **策略3 UserBot 下载 + Bot 上传** —— 源禁止转发（noforwards）、媒体引用失效等
+   只能真正搬运字节时的兜底，最慢。
+
+风控相关：来源/目标的能力判定会按 `transfer.probe_ttl_seconds` 缓存，避免每条消息
+都去撞一次注定失败的权限错误；UserBot 路径有独立的、更保守的节奏与 FloodWait 熔断。
+"""
 import asyncio
 import logging
 import random
 import tempfile
+import time
+from collections import Counter
 
 from telethon import TelegramClient, errors, functions
 from telethon.tl.functions.channels import GetMessagesRequest
@@ -19,6 +38,42 @@ from core.media_transfer import MediaTransferHelper
 from core.rate_limiter import RateLimiter
 
 logger = logging.getLogger("tg_forward_bot.forwarder")
+
+# 策略标识（统计 / 日志用）
+ST_BOT = "bot"
+ST_UB_FORWARD = "userbot_forward"
+ST_UB_COPY = "userbot_copy"
+ST_DOWNLOAD = "download"
+
+STRATEGY_LABELS = {
+    ST_BOT: "Bot直接",
+    ST_UB_FORWARD: "UserBot转发",
+    ST_UB_COPY: "UserBot读+Bot写",
+    ST_DOWNLOAD: "下载+上传",
+}
+
+
+def _error_classes(*names: str) -> tuple:
+    """按名字取 Telethon 异常类，缺失的自动忽略（兼容不同版本）。"""
+    return tuple(c for c in (getattr(errors, n, None) for n in names) if c)
+
+
+# 目标侧「写不进去」的典型错误：命中后本次运行不再重试 UserBot 直发
+TARGET_WRITE_ERRORS = _error_classes(
+    "ChatWriteForbiddenError", "ChatAdminRequiredError", "ChannelPrivateError",
+    "ChatRestrictedError", "ChatSendPlainForbiddenError", "ChatSendMediaForbiddenError",
+)
+# 源侧「读不到」的典型错误：命中后本次运行跳过策略1。
+# 注意不要把 ChatAdminRequiredError 算进来：它既可能是"读源要管理员"，
+# 也可能是"在目标发言要管理员"，误判会让策略1 被冤枉地停用 30 分钟。
+SOURCE_READ_ERRORS = _error_classes(
+    "ChannelPrivateError", "ChannelInvalidError",
+)
+# Bot 侧「写不进去」：只记日志，不做缓存（目标侧权限可能随时被调整）
+BOT_WRITE_ERRORS = _error_classes(
+    "ChatWriteForbiddenError", "ChatAdminRequiredError",
+)
+
 
 
 class Forwarder:
@@ -48,6 +103,27 @@ class Forwarder:
         if self.fast_upload_connections is not None:
             self.fast_upload_connections = int(self.fast_upload_connections)
         self.fast_transfer_min_size_mb = int(transfer_cfg.get("fast_transfer_min_size_mb", 10))
+
+        # ── 策略开关 ──────────────────────────────────────────────
+        # UserBot 直接转发（策略2）：Bot 读不到源时最省事的一条路
+        self.userbot_forward_enabled = bool(transfer_cfg.get("userbot_forward", True))
+        # UserBot 读 + Bot 写（策略2b）：仍不下载，作为策略2 的降级
+        self.userbot_copy_fallback = bool(transfer_cfg.get("userbot_copy_fallback", True))
+        # 连续多少次 UserBot FloodWait 后本次运行放弃策略2（保护账号）
+        self.userbot_max_floods = max(1, int(transfer_cfg.get("userbot_max_flood", 3)))
+        # UserBot 遇 FloodWait 时在官方要求之上多等的秒数（别贴着红线跑）
+        self.userbot_flood_buffer = max(0, int(transfer_cfg.get("userbot_flood_buffer", 5)))
+        # 能力判定缓存有效期：避免每条消息都撞一次注定失败的权限错误
+        self.probe_ttl_seconds = max(30, int(transfer_cfg.get("probe_ttl_seconds", 1800)))
+
+        self._bot_unreadable: dict[int, float] = {}   # source -> 判定时间
+        self._bot_readable: dict[int, float] = {}     # source -> 判定时间
+        self._ub_write_blocked: dict[int, float] = {}  # target -> 判定时间
+        self._noforwards: dict[int, float] = {}       # source -> 判定时间
+        self._ub_floods = 0
+        self._ub_forward_disabled = False
+        self.strategy_counts: Counter[str] = Counter()
+
         self.media = MediaTransferHelper(
             bot=self.bot,
             userbot=self.userbot,
@@ -102,40 +178,120 @@ class Forwarder:
         codec_str = best_codec or "未知编码"
         return best_alt, res_str, codec_str
 
-    async def _forward_messages_drop_author(
-        self, target_chat_id: int, msg_ids: int | list[int],
-        source_ref, topic_id: int | None = None
-    ):
-        """原生无痕转发 (drop_author=True)，保留 100% 画质切片。
-        若带有 topic_id 且发往超级群，注入 top_msg_id 确保落在指定论坛话题。
+    # ------------------------------------------------------------------
+    # 能力判定缓存 / 指标
+    # ------------------------------------------------------------------
+
+    def _cache_valid(self, cache: dict[int, float], key: int) -> bool:
+        ts = cache.get(key)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > self.probe_ttl_seconds:
+            cache.pop(key, None)
+            return False
+        return True
+
+    def _mark_bot_unreadable(self, source_chat_id: int, why: str = "") -> None:
+        if not self._cache_valid(self._bot_unreadable, source_chat_id):
+            logger.info("策略1: Bot 读不到源 chat=%s（%s）-> 本次运行跳过策略1，改用 UserBot 路径",
+                        source_chat_id, why or "权限不足")
+        self._bot_unreadable[source_chat_id] = time.monotonic()
+        self._bot_readable.pop(source_chat_id, None)
+
+    def _mark_bot_readable(self, source_chat_id: int) -> None:
+        self._bot_readable[source_chat_id] = time.monotonic()
+        self._bot_unreadable.pop(source_chat_id, None)
+
+    def _mark_ub_blocked(self, target_chat_id: int, why: str = "") -> None:
+        if not self._cache_valid(self._ub_write_blocked, target_chat_id):
+            logger.info("策略2: UserBot 无法向目标 chat=%s 发言（%s）-> 本次运行改用「UserBot 读 + Bot 写」",
+                        target_chat_id, why or "权限不足")
+        self._ub_write_blocked[target_chat_id] = time.monotonic()
+
+    def _mark_noforwards(self, source_chat_id: int) -> None:
+        if not self._cache_valid(self._noforwards, source_chat_id):
+            logger.info("源 chat=%s 禁止转发（noforwards）-> 全程走复制路径，不再尝试原生转发",
+                        source_chat_id)
+        self._noforwards[source_chat_id] = time.monotonic()
+
+    def _userbot_forward_skip_reason(self, source_chat_id: int,
+                                     target_chat_id: int,
+                                     ub: TelegramClient | None,
+                                     caller: str = "monitor") -> str | None:
+        """策略2 的前置判定，返回跳过原因（None 表示可以尝试）。"""
+        if not self.userbot_forward_enabled:
+            return "transfer.userbot_forward=false"
+        if not ub:
+            return "无可用 UserBot"
+        if caller == "private" or target_chat_id > 0:
+            # 私聊场景保留原来的 Bot 发送与 >300MB 切片规则，不改变既有观感
+            return "私聊目标不走 UserBot 转发"
+        if self._ub_forward_disabled:
+            return f"本次运行 UserBot FloodWait 已超 {self.userbot_max_floods} 次，暂停直发"
+        if self._cache_valid(self._noforwards, source_chat_id):
+            return "源禁止转发(noforwards)"
+        if self._cache_valid(self._ub_write_blocked, target_chat_id):
+            return "该目标已被判定 UserBot 无发言权"
+        return None
+
+    @staticmethod
+    def _looks_like_unreadable(error: Exception) -> bool:
+        """异常是否意味着「这个客户端压根读不到该源」。"""
+        if isinstance(error, SOURCE_READ_ERRORS):
+            return True
+        if isinstance(error, ValueError):
+            text = str(error).lower()
+            return "entity" in text or "peer" in text
+        return False
+
+    def strategy_summary(self) -> str:
+        """本次运行各策略命中次数（用于任务完成消息）。"""
+        parts = [
+            f"{STRATEGY_LABELS[key]} {self.strategy_counts[key]}"
+            for key in (ST_BOT, ST_UB_FORWARD, ST_UB_COPY, ST_DOWNLOAD)
+            if self.strategy_counts.get(key)
+        ]
+        return " · ".join(parts)
+
+    # ------------------------------------------------------------------
+    # 原生转发（Bot / UserBot 共用）
+    # ------------------------------------------------------------------
+
+    async def _native_forward(self, client: TelegramClient, target_chat_id: int,
+                              msg_ids: int | list[int], source_ref,
+                              topic_id: int | None = None,
+                              drop_author: bool = True):
+        """原生转发（服务端搬运，不下载不重传）。
+
+        若带 topic_id 且目标是超级群，注入 top_msg_id 确保落在指定论坛话题。
+        `drop_author=True` 用于 copy 模式：去掉「转发自 X」标记。
         """
         is_single = isinstance(msg_ids, int)
         ids_list = [msg_ids] if is_single else list(msg_ids)
         if not ids_list:
             return None
 
+        payload = ids_list if not is_single else ids_list[0]
+
         # 无 topic_id 或目标是私聊，直接用 Telethon 官方 forward_messages
         if not topic_id or target_chat_id > 0:
-            result = await self.bot.forward_messages(
-                target_chat_id, ids_list if not is_single else ids_list[0],
-                source_ref, drop_author=True
-            )
-            return result
+            return await client.forward_messages(
+                target_chat_id, payload, source_ref, drop_author=drop_author)
 
         # 带有 topic_id 的超级群：使用 MTProto 底层 ForwardMessagesRequest 携带 top_msg_id
         try:
-            to_peer = await self.bot.get_input_entity(target_chat_id)
-            from_peer = await self.bot.get_input_entity(source_ref)
+            to_peer = await client.get_input_entity(target_chat_id)
+            from_peer = await client.get_input_entity(source_ref)
             random_ids = [random.randint(-2**63, 2**63 - 1) for _ in ids_list]
             req = functions.messages.ForwardMessagesRequest(
                 from_peer=from_peer,
                 id=ids_list,
                 to_peer=to_peer,
-                drop_author=True,
+                drop_author=drop_author,
                 top_msg_id=topic_id,
                 random_id=random_ids
             )
-            updates = await self.bot(req)
+            updates = await client(req)
             sent_msgs = []
             for u in getattr(updates, "updates", []):
                 m = getattr(u, "message", None)
@@ -147,11 +303,18 @@ class Forwarder:
         except Exception as e:
             logger.warning("带 topic_id 底层原生转发异常(%s: %s)，回退普通 forward_messages",
                            type(e).__name__, e)
-            result = await self.bot.forward_messages(
-                target_chat_id, ids_list if not is_single else ids_list[0],
-                source_ref, drop_author=True
-            )
-            return result
+            return await client.forward_messages(
+                target_chat_id, payload, source_ref, drop_author=drop_author)
+
+    async def _forward_messages_drop_author(
+        self, target_chat_id: int, msg_ids: int | list[int],
+        source_ref, topic_id: int | None = None
+    ):
+        """兼容旧调用：Bot 侧无痕转发。"""
+        return await self._native_forward(
+            self.bot, target_chat_id, msg_ids, source_ref,
+            topic_id=topic_id, drop_author=True)
+
 
     async def forward_message(self, source_chat_id: int, msg_id: int,
                               target_chat_id: int, mode: str = "copy",
@@ -160,7 +323,7 @@ class Forwarder:
                               userbot: TelegramClient | None = None) -> int | None:
         """
         转发单条消息，返回目标消息 ID。失败返回 None。
-        降级链：Bot直接转发 → UserBot读+Bot写 → UserBot下载+Bot上传 → 发失败标记
+        降级链：Bot直接 → UserBot转发 → UserBot读+Bot写 → UserBot下载+Bot上传 → 发失败标记
         """
         result = await self._run_message_strategies(
             source_chat_id, msg_id, target_chat_id, mode, target_topic_id,
@@ -244,18 +407,21 @@ class Forwarder:
                                       target_topic_id: int | None,
                                       caller: str = "monitor",
                                       userbot: TelegramClient | None = None) -> int | None:
-        await self.rl.wait()
+        # 等待（节奏控制）放在各策略内部：被跳过的层级不白等，Bot/UserBot 各按自己的节奏
         strategies = [
-            ("策略1(Bot直接)", self._try_bot_direct,
+            (ST_BOT, "策略1(Bot直接)", self._try_bot_direct,
              (source_chat_id, msg_id, target_chat_id, mode, target_topic_id, caller)),
-            ("策略2(UserBot读+Bot写)", self._try_userbot_read_bot_forward,
+            (ST_UB_FORWARD, "策略2(UserBot转发)", self._try_userbot_forward,
              (source_chat_id, msg_id, target_chat_id, mode, target_topic_id, caller, userbot)),
-            ("策略3(下载+上传)", self._try_userbot_download_bot_upload,
+            (ST_UB_COPY, "策略2b(UserBot读+Bot写)", self._try_userbot_copy_via_bot,
+             (source_chat_id, msg_id, target_chat_id, target_topic_id, caller, userbot)),
+            (ST_DOWNLOAD, "策略3(下载+上传)", self._try_userbot_download_bot_upload,
              (source_chat_id, msg_id, target_chat_id, target_topic_id, userbot)),
         ]
-        for strategy_name, strategy_func, args in strategies:
+        for key, strategy_name, strategy_func, args in strategies:
             result = await strategy_func(*args)
             if result is not None:
+                self.strategy_counts[key] += 1
                 logger.info("msg=%s %s成功 -> target_msg=%s", msg_id, strategy_name, result)
                 return result
         return None
@@ -265,18 +431,20 @@ class Forwarder:
                                     target_topic_id: int | None,
                                     caller: str = "monitor",
                                     userbot: TelegramClient | None = None) -> list[int]:
-        await self.rl.wait()
         strategies = [
-            ("策略1(Bot直接)", self._try_bot_direct_album,
+            (ST_BOT, "策略1(Bot直接)", self._try_bot_direct_album,
              (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id, caller)),
-            ("策略2(UserBot读+Bot写)", self._try_userbot_read_bot_forward_album,
+            (ST_UB_FORWARD, "策略2(UserBot转发)", self._try_userbot_forward_album,
              (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id, caller, userbot)),
-            ("策略3(下载+上传)", self._try_userbot_download_bot_upload_album,
+            (ST_UB_COPY, "策略2b(UserBot读+Bot写)", self._try_userbot_copy_via_bot_album,
+             (source_chat_id, msg_ids, target_chat_id, target_topic_id, caller, userbot)),
+            (ST_DOWNLOAD, "策略3(下载+上传)", self._try_userbot_download_bot_upload_album,
              (source_chat_id, msg_ids, target_chat_id, target_topic_id, userbot)),
         ]
-        for strategy_name, strategy_func, args in strategies:
+        for key, strategy_name, strategy_func, args in strategies:
             result = await strategy_func(*args)
             if result:
+                self.strategy_counts[key] += 1
                 logger.info("album=%s %s成功 -> target_msgs=%s", msg_ids, strategy_name, result)
                 return result
         return []
@@ -285,6 +453,10 @@ class Forwarder:
                               target_chat_id, mode, topic_id,
                               caller: str = "monitor") -> int | None:
         is_private = (caller == "private") or (target_chat_id > 0)
+        if self._cache_valid(self._bot_unreadable, source_chat_id):
+            logger.debug("策略1: msg=%s 已在本次运行判定 Bot 读不到源，跳过", msg_id)
+            return None
+        await self.rl.wait()
         logger.info("策略1: msg=%s 收到调用 caller=%s is_private=%s chat=%s mode=%s",
                     msg_id, caller, is_private, source_chat_id, mode)
         try:
@@ -292,15 +464,19 @@ class Forwarder:
             if mode == "forward":
                 result = await self.bot.forward_messages(
                     target_chat_id, msg_id, source_ref)
+                if result:
+                    self._mark_bot_readable(source_chat_id)
                 return result.id if result else None
 
             # mode == "copy":
             # 1. 优先尝试未受限频道原生无痕转发 (drop_author=True)，所有 caller 均生效 [保留全套切片与 HLS]
             can_drop_author = True
+            unreadable_signal = None
             try:
                 source_entity = await self.bot.get_entity(source_ref)
                 if getattr(source_entity, "noforwards", False):
                     can_drop_author = False
+                    self._mark_noforwards(source_chat_id)
             except Exception:
                 pass
 
@@ -318,11 +494,15 @@ class Forwarder:
                 except errors.ChatForwardsRestrictedError:
                     logger.info("策略1: msg=%s 转发受限(ChatForwardsRestrictedError)，转入受限处理流程", msg_id)
                 except Exception as e:
+                    if self._looks_like_unreadable(e):
+                        unreadable_signal = e
                     logger.info("策略1: msg=%s 无痕转发异常(%s: %s)，转入受限处理流程", msg_id, type(e).__name__, e)
 
             # 2. 受限或无痕转发失败：获取源消息
             msg = await self._get_single_message_for_bot(source_chat_id, source_ref, msg_id)
             if not msg:
+                if unreadable_signal is not None:
+                    self._mark_bot_unreadable(source_chat_id, type(unreadable_signal).__name__)
                 logger.info("策略1: msg=%s Bot 无法获取消息", msg_id)
                 return None
 
@@ -368,11 +548,27 @@ class Forwarder:
 
             # 常规复制（非私聊或切片放弃/回退）
             result = await self._copy_message(self.bot, msg, target_chat_id, topic_id)
-            return result.id if result else None
-        except (errors.ChatForwardsRestrictedError,
-                errors.ChannelPrivateError,
-                errors.ChatAdminRequiredError) as e:
-            logger.info("策略1: msg=%s Bot 无权限: %s", msg_id, type(e).__name__)
+            if result:
+                self._mark_bot_readable(source_chat_id)
+                return result.id
+            return None
+        except errors.ChatForwardsRestrictedError as e:
+            logger.info("策略1: msg=%s Bot 转发受限: %s", msg_id, type(e).__name__)
+            self._mark_noforwards(source_chat_id)
+            return None
+        except SOURCE_READ_ERRORS as e:
+            logger.info("策略1: msg=%s Bot 读不到源: %s", msg_id, type(e).__name__)
+            self._mark_bot_unreadable(source_chat_id, type(e).__name__)
+            return None
+        except BOT_WRITE_ERRORS as e:
+            logger.info("策略1: msg=%s Bot 无发言权限: %s", msg_id, type(e).__name__)
+            return None
+        except ValueError as e:
+            if "entity" in str(e).lower() or "peer" in str(e).lower():
+                logger.info("策略1: msg=%s Bot 无法解析源实体: %s", msg_id, e)
+                self._mark_bot_unreadable(source_chat_id, "无法解析实体")
+                return None
+            logger.warning("策略1: msg=%s Bot 异常: %s", msg_id, e)
             return None
         except errors.FloodWaitError as e:
             return await self._handle_flood(e, self._try_bot_direct,
@@ -386,6 +582,10 @@ class Forwarder:
                                     target_chat_id, mode, topic_id,
                                     caller: str = "monitor") -> list[int]:
         is_private = (caller == "private") or (target_chat_id > 0)
+        if self._cache_valid(self._bot_unreadable, source_chat_id):
+            logger.debug("策略1相册: msgs=%s 已在本次运行判定 Bot 读不到源，跳过", msg_ids)
+            return []
+        await self.rl.wait()
         logger.info("策略1相册: msgs=%s 收到调用 caller=%s is_private=%s chat=%s mode=%s",
                     msg_ids, caller, is_private, source_chat_id, mode)
         try:
@@ -393,15 +593,20 @@ class Forwarder:
             if mode == "forward":
                 result = await self.bot.forward_messages(
                     target_chat_id, msg_ids, source_ref)
-                return self._extract_result_ids(result)
+                ids = self._extract_result_ids(result)
+                if ids:
+                    self._mark_bot_readable(source_chat_id)
+                return ids
 
             # mode == "copy":
             # 1. 优先尝试未受限频道原生无痕相册转发 (drop_author=True)，所有 caller 均生效
             can_drop_author = True
+            unreadable_signal = None
             try:
                 source_entity = await self.bot.get_entity(source_ref)
                 if getattr(source_entity, "noforwards", False):
                     can_drop_author = False
+                    self._mark_noforwards(source_chat_id)
             except Exception:
                 pass
 
@@ -419,12 +624,16 @@ class Forwarder:
                 except errors.ChatForwardsRestrictedError:
                     logger.info("策略1相册: msgs=%s 转发受限，转入受限处理流程", msg_ids)
                 except Exception as e:
+                    if self._looks_like_unreadable(e):
+                        unreadable_signal = e
                     logger.info("策略1相册: msgs=%s 无痕相册转发异常(%s: %s)，转入受限处理流程",
                                 msg_ids, type(e).__name__, e)
 
             # 2. 受限或无痕转发失败：获取消息列表
             msgs = await self._get_message_list_for_bot(source_chat_id, source_ref, msg_ids)
             if not msgs:
+                if unreadable_signal is not None:
+                    self._mark_bot_unreadable(source_chat_id, type(unreadable_signal).__name__)
                 logger.info("策略1相册: Bot 无法获取消息 %s", msg_ids)
                 return []
 
@@ -458,11 +667,27 @@ class Forwarder:
                                     m.id, sz_mb)
 
             result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
-            return self._extract_result_ids(result)
-        except (errors.ChatForwardsRestrictedError,
-                errors.ChannelPrivateError,
-                errors.ChatAdminRequiredError) as e:
-            logger.info("策略1相册: Bot 无权限: %s", type(e).__name__)
+            ids = self._extract_result_ids(result)
+            if ids:
+                self._mark_bot_readable(source_chat_id)
+            return ids
+        except errors.ChatForwardsRestrictedError as e:
+            logger.info("策略1相册: Bot 转发受限: %s", type(e).__name__)
+            self._mark_noforwards(source_chat_id)
+            return []
+        except SOURCE_READ_ERRORS as e:
+            logger.info("策略1相册: Bot 读不到源: %s", type(e).__name__)
+            self._mark_bot_unreadable(source_chat_id, type(e).__name__)
+            return []
+        except BOT_WRITE_ERRORS as e:
+            logger.info("策略1相册: Bot 无发言权限: %s", type(e).__name__)
+            return []
+        except ValueError as e:
+            if "entity" in str(e).lower() or "peer" in str(e).lower():
+                logger.info("策略1相册: Bot 无法解析源实体: %s", e)
+                self._mark_bot_unreadable(source_chat_id, "无法解析实体")
+                return []
+            logger.warning("策略1相册: Bot 异常: %s", e)
             return []
         except errors.FloodWaitError as e:
             return await self._handle_flood(
@@ -472,65 +697,151 @@ class Forwarder:
             logger.warning("策略1相册: Bot 异常: %s", e)
             return []
 
-    async def _try_userbot_read_bot_forward(self, source_chat_id, msg_id,
-                                            target_chat_id, mode, topic_id,
-                                            caller: str = "monitor",
-                                            userbot: TelegramClient | None = None) -> int | None:
+    # ------------------------------------------------------------------
+    # 策略2：UserBot 直接转发（服务端搬运，不下载不重传）
+    # ------------------------------------------------------------------
+
+    async def _try_userbot_forward(self, source_chat_id, msg_id,
+                                   target_chat_id, mode, topic_id,
+                                   caller: str = "monitor",
+                                   userbot: TelegramClient | None = None) -> int | None:
         ub = userbot or self.userbot
+        skip = self._userbot_forward_skip_reason(source_chat_id, target_chat_id, ub, caller)
+        if skip:
+            logger.info("策略2: msg=%s 跳过（%s）", msg_id, skip)
+            return None
+
+        # UserBot 是用户账号，节奏比 Bot 更保守
+        await self.rl.wait(kind="userbot")
         try:
-            msg = await self._get_single_message(ub, source_chat_id, msg_id)
-            if not msg:
-                logger.info("策略2: msg=%s UserBot 无法获取消息", msg_id)
-                return None
-            if mode == "forward":
-                result = await ub.forward_messages(
-                    target_chat_id, msg_id, source_chat_id)
-            else:
-                result = await self._copy_message(
-                    self.bot, msg, target_chat_id, topic_id)
-            return result.id if result else None
+            logger.info("策略2: msg=%s 由 UserBot 直接转发 drop_author=%s",
+                        msg_id, mode != "forward")
+            result = await self._native_forward(
+                ub, target_chat_id, msg_id, source_chat_id,
+                topic_id=topic_id, drop_author=(mode != "forward"))
+            if result:
+                self._ub_floods = 0
+                return result.id if not isinstance(result, list) else (
+                    result[0].id if result and getattr(result[0], "id", None) else None)
+            return None
         except errors.ChatForwardsRestrictedError:
-            logger.info("策略2: msg=%s 转发受限", msg_id)
+            logger.info("策略2: msg=%s 源禁止转发(ChatForwardsRestrictedError)", msg_id)
+            self._mark_noforwards(source_chat_id)
             return None
         except errors.FloodWaitError as e:
-            return await self._handle_flood(e, self._try_userbot_read_bot_forward,
-                                            source_chat_id, msg_id,
-                                            target_chat_id, mode, topic_id, caller, ub)
+            return await self._handle_userbot_flood(
+                e, self._try_userbot_forward,
+                source_chat_id, msg_id, target_chat_id, mode, topic_id, caller, ub)
+        except TARGET_WRITE_ERRORS as e:
+            logger.info("策略2: msg=%s UserBot 无法写入目标: %s", msg_id, type(e).__name__)
+            self._mark_ub_blocked(target_chat_id, type(e).__name__)
+            return None
         except Exception as e:
             logger.warning("策略2: msg=%s 异常: %s", msg_id, e)
             return None
 
-    async def _try_userbot_read_bot_forward_album(self, source_chat_id, msg_ids,
-                                                  target_chat_id, mode, topic_id,
-                                                  caller: str = "monitor",
-                                                  userbot: TelegramClient | None = None) -> list[int]:
+    async def _try_userbot_forward_album(self, source_chat_id, msg_ids,
+                                         target_chat_id, mode, topic_id,
+                                         caller: str = "monitor",
+                                         userbot: TelegramClient | None = None) -> list[int]:
         ub = userbot or self.userbot
+        skip = self._userbot_forward_skip_reason(source_chat_id, target_chat_id, ub, caller)
+        if skip:
+            logger.info("策略2相册: msgs=%s 跳过（%s）", msg_ids, skip)
+            return []
+
+        await self.rl.wait(kind="userbot")
+        try:
+            logger.info("策略2相册: msgs=%s 由 UserBot 直接整组转发 drop_author=%s",
+                        msg_ids, mode != "forward")
+            result = await self._native_forward(
+                ub, target_chat_id, msg_ids, source_chat_id,
+                topic_id=topic_id, drop_author=(mode != "forward"))
+            ids = self._extract_result_ids(result)
+            if ids:
+                self._ub_floods = 0
+            return ids
+        except errors.ChatForwardsRestrictedError:
+            logger.info("策略2相册: msgs=%s 源禁止转发", msg_ids)
+            self._mark_noforwards(source_chat_id)
+            return []
+        except errors.FloodWaitError as e:
+            return await self._handle_userbot_flood(
+                e, self._try_userbot_forward_album,
+                source_chat_id, msg_ids, target_chat_id, mode, topic_id, caller, ub)
+        except TARGET_WRITE_ERRORS as e:
+            logger.info("策略2相册: msgs=%s UserBot 无法写入目标: %s",
+                        msg_ids, type(e).__name__)
+            self._mark_ub_blocked(target_chat_id, type(e).__name__)
+            return []
+        except Exception as e:
+            logger.warning("策略2相册: msgs=%s 异常: %s", msg_ids, e)
+            return []
+
+    # ------------------------------------------------------------------
+    # 策略2b：UserBot 读 + Bot 写（仍不下载，只是换了发送方）
+    # ------------------------------------------------------------------
+
+    async def _try_userbot_copy_via_bot(self, source_chat_id, msg_id,
+                                        target_chat_id, topic_id,
+                                        caller: str = "monitor",
+                                        userbot: TelegramClient | None = None) -> int | None:
+        if not self.userbot_copy_fallback:
+            return None
+        ub = userbot or self.userbot
+        await self.rl.wait()
+        try:
+            msg = await self._get_single_message(ub, source_chat_id, msg_id)
+            if not msg:
+                logger.info("策略2b: msg=%s UserBot 无法获取消息", msg_id)
+                return None
+            result = await self._copy_message(
+                self.bot, msg, target_chat_id, topic_id)
+            return result.id if result else None
+        except errors.ChatForwardsRestrictedError:
+            logger.info("策略2b: msg=%s 转发受限", msg_id)
+            self._mark_noforwards(source_chat_id)
+            return None
+        except errors.FloodWaitError as e:
+            return await self._handle_flood(e, self._try_userbot_copy_via_bot,
+                                            source_chat_id, msg_id,
+                                            target_chat_id, topic_id, caller, ub)
+        except Exception as e:
+            logger.warning("策略2b: msg=%s 异常: %s", msg_id, e)
+            return None
+
+    async def _try_userbot_copy_via_bot_album(self, source_chat_id, msg_ids,
+                                              target_chat_id, topic_id,
+                                              caller: str = "monitor",
+                                              userbot: TelegramClient | None = None) -> list[int]:
+        if not self.userbot_copy_fallback:
+            return []
+        ub = userbot or self.userbot
+        await self.rl.wait()
         try:
             msgs = await self._get_message_list(ub, source_chat_id, msg_ids)
             if not msgs:
-                logger.info("策略2相册: UserBot 无法获取消息 %s", msg_ids)
+                logger.info("策略2b相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
-            if mode == "forward":
-                result = await ub.forward_messages(
-                    target_chat_id, msg_ids, source_chat_id)
-            else:
-                result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
+            result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
             return self._extract_result_ids(result)
         except errors.ChatForwardsRestrictedError:
-            logger.info("策略2相册: 转发受限")
+            logger.info("策略2b相册: 转发受限")
+            self._mark_noforwards(source_chat_id)
             return []
         except errors.FloodWaitError as e:
             return await self._handle_flood(
-                e, self._try_userbot_read_bot_forward_album,
-                source_chat_id, msg_ids, target_chat_id, mode, topic_id, caller, ub)
+                e, self._try_userbot_copy_via_bot_album,
+                source_chat_id, msg_ids, target_chat_id, topic_id, caller, ub)
         except Exception as e:
-            logger.warning("策略2相册: 异常: %s", e)
+            logger.warning("策略2b相册: 异常: %s", e)
             return []
 
     async def _try_userbot_download_bot_upload(self, source_chat_id, msg_id,
                                                target_chat_id, topic_id,
                                                userbot: TelegramClient | None = None) -> int | None:
         ub = userbot or self.userbot
+        await self.rl.wait()
         try:
             msg = await self._get_single_message(ub, source_chat_id, msg_id)
             if not msg:
@@ -572,6 +883,7 @@ class Forwarder:
                                                      target_chat_id, topic_id,
                                                      userbot: TelegramClient | None = None) -> list[int]:
         ub = userbot or self.userbot
+        await self.rl.wait()
         try:
             msgs = await self._get_message_list(ub, source_chat_id, msg_ids)
             if not msgs:
@@ -782,6 +1094,31 @@ class Forwarder:
             logger.error("FloodWait %ds 超过最大等待 %ds，放弃", wait_seconds, self.rl.max_flood_wait)
             return None
         logger.warning("FloodWaitError: 等待 %ds 后重试", wait_seconds)
+        self.rl.on_flood_wait()
+        await asyncio.sleep(wait_seconds)
+        return await retry_func(*args)
+
+    async def _handle_userbot_flood(self, error: errors.FloodWaitError,
+                                    retry_func, *args):
+        """UserBot 路径的 FloodWait：多留余量、累计计数，超限就本次运行停用策略2。
+
+        用户账号被限流后继续贴着官方秒数重试，是最容易被升级为「临时限制/强制下线」
+        的做法，所以这里额外加缓冲，并在连续命中后主动退回 Bot/下载路径。
+        """
+        self._ub_floods += 1
+        if self._ub_floods >= self.userbot_max_floods:
+            if not self._ub_forward_disabled:
+                self._ub_forward_disabled = True
+                logger.error(
+                    "UserBot 连续 %d 次 FloodWait -> 本次运行停用策略2，后续改走 Bot/下载路径"
+                    "（重启进程或换账号后恢复）", self._ub_floods)
+            return None
+        wait_seconds = int(error.seconds) + self.userbot_flood_buffer
+        if wait_seconds > self.rl.max_flood_wait + self.userbot_flood_buffer:
+            logger.error("UserBot FloodWait %ds 超过最大等待，放弃本条", wait_seconds)
+            return None
+        logger.warning("UserBot FloodWait: 等待 %ds 后重试（连续第 %d 次）",
+                       wait_seconds, self._ub_floods)
         self.rl.on_flood_wait()
         await asyncio.sleep(wait_seconds)
         return await retry_func(*args)

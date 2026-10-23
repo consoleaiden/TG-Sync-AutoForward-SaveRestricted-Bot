@@ -557,12 +557,15 @@ class Syncer(ForwardingComponent):
         restricted_line = f"\n• 受限(Takeout)成功: {restricted_success:,} 条"
         if restricted_fail:
             restricted_line += f"，失败 {restricted_fail:,} 条"
+        summary = self.forwarder.strategy_summary() if hasattr(self.forwarder, "strategy_summary") else ""
+        strategy_line = f"\n• 策略分布: {summary}" if summary else ""
         await _report(
             "✅ 克隆完成"
             f"\n{progress_bar(done, plan.total or done)}"
             f"\n• 本次新增: {done - plan.done_before:,} 条"
             f"{restricted_line}"
             f"\n• 失败: {failed:,} 条 · 跳过: {skipped:,} 条"
+            f"{strategy_line}"
             f"\n• 最终游标: msg_id={cursor}")
 
         # 完成后默认转「持续监听」（handlers 注入的钩子，未设置则什么都不做）

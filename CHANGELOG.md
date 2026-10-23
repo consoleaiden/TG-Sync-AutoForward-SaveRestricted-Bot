@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed（转发策略：私有频道不再下载）
+- **统一降级链**（`core/forwarder.py`）：公共频道与私有频道走同一顺序，逐级降级
+  `① Bot 直接克隆 → ② UserBot 转发 → ②b UserBot 读+Bot 写 → ③ 下载+上传 → ④ 失败标记`。
+  - 新增 **策略②（`_try_userbot_forward` / `_try_userbot_forward_album`）**：由 UserBot
+    调用 `forward_messages` 直接搬运，`copy` 模式用 `drop_author=True` 去掉来源标记。
+    服务端搬运，不落地、不受上传体积上限约束，1GB 视频从「几分钟」降到「一次 RPC」。
+  - 原「UserBot 读 + Bot 写」下移为 **策略②b**（`_try_userbot_copy_via_bot*`），
+    仍是"不下载"的兜底，用于 UserBot 能读源但进不了目标的情况。
+  - `_forward_messages_drop_author` 泛化为 `_native_forward(client, ...)`，Bot/UserBot 共用，
+    论坛话题的 `top_msg_id` 注入对两者都生效。
+  - **边界**：私聊目标（`caller="private"` 或 `target_chat_id > 0`）仍走 Bot 发送，
+    保留原有的 >300MB 视频切片规则，不改变私聊解析的既有观感。
+- **能力判定缓存**（`transfer.probe_ttl_seconds`，默认 1800s）：
+  「Bot 读不到该源」`_bot_unreadable`、「UserBot 发不进该目标」`_ub_write_blocked`、
+  「源禁止转发」`_noforwards` 判定一次即复用。私有频道克隆不再逐条撞
+  `ChannelPrivateError` / `ValueError`（几千条就是几千次无效 RPC），这也是提速的主要来源之一。
+- **UserBot 风控**（用户账号代价远高于 Bot）：
+  - `RateLimiter.wait(kind="userbot")`：独立节奏 `userbot_forward_interval`（默认 3–6s）
+    与批次长歇 `userbot_forward_pause_every: 25` / `userbot_forward_pause_time: [60,120]`，
+    命中策略②时**替换**通用间隔而非叠加；
+  - `_handle_userbot_flood`：FloodWait 额外多等 `userbot_flood_buffer`（默认 5s），
+    连续 `userbot_max_flood`（默认 3）次后**本次运行熔断策略②**，改走 Bot/下载路径；
+  - 源 `noforwards` 直接跳过策略②，不做注定被拒的尝试。
+- **可观测**：`Forwarder.strategy_counts` 统计各层命中次数，克隆完成消息新增
+  「策略分布: Bot直接 N · UserBot转发 M · …」一行；日志区分 `策略2` / `策略2b`。
+- **配置**（`config.example.yaml`）：`transfer.userbot_forward`、`userbot_copy_fallback`、
+  `userbot_max_flood`、`userbot_flood_buffer`、`probe_ttl_seconds`；
+  `rate_limit.userbot_forward_*` 三项。
+- **行为差异（注意）**：`copy` 模式在策略②下由 **UserBot** 发帖（`drop_author` 只去掉
+  「转发自」）。要求署名必须是 Bot 时设 `transfer.userbot_forward: false`。
+- 文档：README / README.en 重写「转发策略」为分层表（含成本、适用条件、身份变化）；
+  `docs/clone.md` 新增「转发策略：私有频道不再下载」「风控：怎么把 UserBot 的风险压到最低」
+  两节与对应 FAQ；`docs/architecture.md` 设计原则补充例外。
+- 测试：新增 `test/test_forward_strategy.py`（16 例）——层级命中、copy/forward 的
+  `drop_author`、UserBot 不能写目标时回退②b、两层都失败走③、能力缓存（Bot 与目标两侧）、
+  noforwards 跳过、`userbot_forward: false`、私聊目标不走 UserBot、FloodWait 熔断与禁用后
+  不再调用、RateLimiter 的 userbot 计数、策略摘要渲染。
+
 ### Added
 - **克隆记录永久保留**：`completed` 的克隆任务不再从列表消失。
   - 列表查询改为 `status != 'deleted'`，并按 `running → paused → failed → 其它` 排序，
