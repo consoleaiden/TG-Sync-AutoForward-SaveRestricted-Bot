@@ -17,6 +17,9 @@ async def create_task(db: Database, task_type: str, source_chat_id: int,
                       target_topic_id: int | None = None,
                       start_msg_id: int = 0,
                       start_date: str | None = None,
+                      end_msg_id: int = 0,
+                      follow: int = 0,
+                      parent_id: int | None = None,
                       source_title: str | None = None,
                       target_title: str | None = None,
                       notify_chat_id: int | None = None,
@@ -25,12 +28,14 @@ async def create_task(db: Database, task_type: str, source_chat_id: int,
     cursor = await db.db.execute(
         """INSERT INTO tasks (type, source_chat_id, source_topic_id,
            target_chat_id, target_topic_id, mode,
-           start_msg_id, start_date, source_title, target_title,
+           start_msg_id, start_date, end_msg_id, follow, parent_id,
+           source_title, target_title,
            notify_chat_id, notify_msg_id, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_type, source_chat_id, source_topic_id,
          target_chat_id, target_topic_id, mode,
-         start_msg_id or 0, start_date, source_title, target_title,
+         start_msg_id or 0, start_date, int(end_msg_id or 0), int(follow or 0),
+         parent_id, source_title, target_title,
          notify_chat_id, notify_msg_id, created_by),
     )
     await db.db.commit()
@@ -118,6 +123,73 @@ async def update_task_notify(db: Database, task_id: int,
     await db.db.execute(
         "UPDATE tasks SET notify_chat_id=?, notify_msg_id=? WHERE id=?",
         (chat_id, msg_id, task_id))
+    await db.db.commit()
+
+
+async def set_follow(db: Database, task_id: int, follow: int,
+                     follow_task_id: int | None = None) -> None:
+    """设置克隆任务的「持续监听」开关，并记住对应的监听任务号。"""
+    if follow_task_id is None:
+        await db.db.execute(
+            "UPDATE tasks SET follow=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (1 if follow else 0, task_id))
+    else:
+        await db.db.execute(
+            "UPDATE tasks SET follow=?, follow_task_id=?,"
+            " updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (1 if follow else 0, follow_task_id, task_id))
+    await db.db.commit()
+
+
+async def find_follow_task(db: Database, task: dict) -> dict | None:
+    """取克隆任务对应的监听任务（先看 follow_task_id，再按源/目标兜底）。"""
+    fid = int(task.get("follow_task_id") or 0)
+    if fid:
+        row = await get_task(db, fid)
+        if row and row.get("status") != "deleted":
+            return row
+    return await find_monitor_task(
+        db, task["source_chat_id"], task["target_chat_id"],
+        task.get("source_topic_id"), task.get("target_topic_id"),
+        statuses=("running", "paused", "failed"))
+
+
+async def find_clone_task(db: Database, source_chat_id: int,
+                          target_chat_id: int,
+                          source_topic_id: int | None,
+                          target_topic_id: int | None,
+                          statuses: tuple[str, ...] | None = None) -> dict | None:
+    """找同一「源话题 → 目标话题」最近的克隆任务（默认不限状态，含已完成）。"""
+    sql = """SELECT * FROM tasks
+             WHERE type IN ('sync','sync_restricted')
+               AND source_chat_id=? AND target_chat_id=?
+               AND IFNULL(source_topic_id,0)=IFNULL(?,0)
+               AND IFNULL(target_topic_id,0)=IFNULL(?,0)"""
+    args: list = [source_chat_id, target_chat_id, source_topic_id, target_topic_id]
+    if statuses:
+        sql += f" AND status IN ({','.join('?' * len(statuses))})"
+        args.extend(statuses)
+    else:
+        sql += " AND status != 'deleted'"
+    sql += " ORDER BY id DESC LIMIT 1"
+    cursor = await db.db.execute(sql, args)
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def reopen_clone_task(db: Database, task_id: int,
+                            *, follow: int | None = 1,
+                            clear_end: bool = True) -> None:
+    """重开一个已完成/暂停的克隆任务：状态回到 running，游标保持不变。"""
+    sets = ["status='running'", "updated_at=CURRENT_TIMESTAMP"]
+    args: list = []
+    if follow is not None:
+        sets.append("follow=?")
+        args.append(1 if follow else 0)
+    if clear_end:
+        sets.append("end_msg_id=0")
+    args.append(task_id)
+    await db.db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", args)
     await db.db.commit()
 
 
@@ -212,6 +284,26 @@ async def save_message_map(db: Database, task_id: int,
 async def get_all_active_tasks(db: Database) -> list[dict]:
     cursor = await db.db.execute(
         "SELECT * FROM tasks WHERE status IN ('running', 'paused', 'failed') ORDER BY id DESC"
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_tasks_for_list(db: Database, types: tuple[str, ...],
+                             limit: int = 20) -> list[dict]:
+    """任务列表用：包含已完成的克隆任务（记录永久保留），运行中的排前面。"""
+    if not types:
+        return []
+    placeholders = ",".join("?" * len(types))
+    cursor = await db.db.execute(
+        f"""SELECT * FROM tasks
+            WHERE type IN ({placeholders}) AND status != 'deleted'
+            ORDER BY CASE status WHEN 'running' THEN 0
+                                 WHEN 'paused' THEN 1
+                                 WHEN 'failed' THEN 2
+                                 ELSE 3 END,
+                     id DESC
+            LIMIT ?""",
+        (*types, max(1, int(limit))),
     )
     return [dict(r) for r in await cursor.fetchall()]
 

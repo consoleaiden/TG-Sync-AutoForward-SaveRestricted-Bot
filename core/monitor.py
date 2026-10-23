@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 
-from telethon import TelegramClient, events, errors
+from telethon import TelegramClient, events, errors, utils
 from telethon.tl.types import MessageService
 
 from core.base_component import ForwardingComponent
@@ -195,6 +195,26 @@ class MonitorManager(ForwardingComponent):
         self.bump_stats(task_id, done=ok, fail=len(msg_ids) - ok,
                         msg_id=msg_ids[-1])
 
+    @staticmethod
+    def _match_chat(event, chat_id: int) -> bool:
+        """判断事件是否来自目标源。
+
+        不用 `NewMessage(chats=...)`：那要求该客户端能解析出实体，
+        私有频道/新加入的频道解析失败时会**静默收不到任何更新**（表现为
+        「任务建了但没监控」）。改为接收全部更新后自己做整数比较，稳定得多。
+        """
+        got = getattr(event, "chat_id", None)
+        if got is None:
+            peer = getattr(getattr(event, "message", None), "peer_id", None)
+            if peer is None:
+                # 无法判定来源时放行，避免「静默漏转」比误转更难排查
+                return True
+            try:
+                got = utils.get_peer_id(peer)
+            except Exception:
+                return True
+        return int(got) == int(chat_id)
+
     async def start_monitor(self, task_id: int, source_chat_id: int,
                             target_chat_id: int, mode: str = "copy",
                             source_topic_id: int | None = None,
@@ -204,6 +224,8 @@ class MonitorManager(ForwardingComponent):
         active_userbot = await self.get_active_userbot(source_chat_id, userbot)
 
         async def handler(event):
+            if not self._match_chat(event, source_chat_id):
+                return
             # 跳过系统消息
             if isinstance(event.message, MessageService):
                 return
@@ -291,8 +313,7 @@ class MonitorManager(ForwardingComponent):
                 self.bump_stats(task_id, fail=1, msg_id=event.message.id,
                                 error=f"{type(e).__name__}: {e}")
 
-        active_userbot.add_event_handler(
-            handler, events.NewMessage(chats=source_chat_id))
+        active_userbot.add_event_handler(handler, events.NewMessage())
         self._handlers[task_id] = (handler, active_userbot)
         # 单个任务一个落盘协程，避免每条消息都写库
         self._stats_tasks[task_id] = asyncio.create_task(self._stats_loop(task_id))

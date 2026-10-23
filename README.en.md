@@ -7,14 +7,18 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 ## Features
 
 - **Button Menu** — `/start` opens a guided, button-driven menu; no commands or arguments to memorise
+- **Short Commands** — `/kl` clone & keep following, `/kl 100-1100` clone an ID range, `/jt` follow only, `/kllb` / `/jtlb` task lists, `/kljx` resume-and-catch-up, `/chapd` identify a source channel
 - **Channel Cloning** — Clone any channel/group (including forum topics) from the earliest message to the latest
-- **Selectable Start Point** — From the beginning, from a message ID, from a date/time, or resume the previous run
+- **Selectable Start Point** — From the beginning, from a message ID, from a message ID **range**, from a date/time, or resume the previous run
 - **Live Progress** — Progress bar, percentage, speed and ETA, refreshed in place on a single message
 - **Resumable** — Pause, crash or restart and it continues from the saved cursor with no duplicates or gaps
+- **Records Never Disappear** — Finished clones (`completed`) stay in the clone task list, so you can `/kljx` to catch up or re-enable following at any time; deletion is a soft delete
+- **Auto Follow-After-Finish** — When a clone finishes it keeps watching for new messages (`clone.follow_after_finish`) and stays visible in the monitor list; toggle it per task with 🛰 / ⏹ in the task detail
 - **Link Parsing** — Send a `t.me/...` link in private chat to trigger forwarding; supports public/private channels, groups, comments, and forum topics
 - **Historical Sync** — `/sync` pulls past messages with resumable progress tracking; restricted messages are automatically forwarded via Takeout inline
 - **Restricted Message Sync** — `/syncrestrictedmsg` re-exports only platform-restricted messages using Telegram's Takeout API
-- **Real-Time Monitoring** — `/monitor` watches for new messages and forwards them automatically
+- **Real-Time Monitoring** — `/jt` or the menu watches for new messages and forwards them automatically; the monitor list shows each task's source, target and forwarded count, and duplicate monitors are rejected
+- **Source Identification** — Run `/chapd`, then forward any message from the channel into the chat; the bot returns the channel title, @username, ID, a usable link and ready-to-copy commands
 - **Graceful Degradation** — Bot direct → UserBot-assisted → download & re-upload → failure marker `#fail2forward`
 - **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
 - **Hard-Block Filtering** — Automatically skips globally restricted content (`platform=all`); platform-specific restrictions are still forwarded
@@ -77,14 +81,30 @@ python main.py
 
 ## Commands
 
+**Primary commands (recommended)**
+
+| Command                        | Description                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------- |
+| `/kl <link>`                   | Clone all messages to this chat, then keep following new messages automatically   |
+| `/kl <start>-<end> <link>`     | Clone only a message ID range (inclusive), e.g. `/kl 100-1100 https://t.me/xxx`   |
+| `/kljx <link>`                 | Continue cloning from the saved cursor up to the newest; nothing is duplicated    |
+| `/jt <link>`                   | Follow new messages only (no history backfill)                                    |
+| `/kllb`                        | Clone task list (includes completed tasks — records are kept forever)             |
+| `/jtlb`                        | Monitor task list (includes follow-ups created from clone tasks)                  |
+| `/chapd`                       | Prompts you to forward a channel message here to identify title / @username / ID  |
+| `/help`                        | Show every command with its purpose                                               |
+| `/start` · `/menu`             | Button menu: wizard, progress, pause/resume, toggle follow                        |
+| `/settings`                    | Rate-limit configuration and storage status                                       |
+
+**Legacy commands**
+
 | Command                       | Description                                                                                        |
 | ----------------------------- | -------------------------------------------------------------------------------------------------- |
 | `/sync <link> [--forward]`    | Sync historical messages to the current chat; restricted messages are forwarded via Takeout inline |
 | `/syncrestrictedmsg <link>`   | Re-export only restricted messages to the current chat via Takeout                                 |
-| `/monitor <link> [--forward]` | Monitor new messages and forward to the current chat (UserBot must have joined the source)         |
+| `/monitor <link> [--forward]` | Same as `/jt`: monitor new messages and forward to the current chat                                |
 | `/list`                       | Task management: pause / resume / delete / clear                                                   |
-| `/settings`                   | View rate-limit configuration                                                                      |
-| `/start` · `/help`            | Startup guide and help                                                                             |
+| `/clone [link]`               | Open the clone wizard                                                                              |
 
 Sending a `t.me/...` link in a private chat with the bot triggers parsing and forwarding.
 

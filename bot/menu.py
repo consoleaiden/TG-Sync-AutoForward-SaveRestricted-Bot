@@ -88,6 +88,7 @@ class MenuController:
                  is_admin, format_display,
                  resolve_source, resolve_target,
                  create_task, stop_task, resume_task,
+                 toggle_follow=None, continue_task=None,
                  monitor_manager=None):
         self.bot = bot
         self.db = db
@@ -100,6 +101,8 @@ class MenuController:
         self._create_task = create_task
         self._stop_task = stop_task
         self._resume_task = resume_task
+        self._toggle_follow = toggle_follow
+        self._continue_task = continue_task
         self.monitor_manager = monitor_manager
         self._wizards: dict[tuple[int, int], Wizard] = {}
 
@@ -143,12 +146,12 @@ class MenuController:
         )
         buttons = [
             [Button.inline("📥 新建克隆任务", data="m:new:clone")],
-            [Button.inline("👁 实时监控新消息", data="m:new:monitor")],
-            [Button.inline("📋 我的任务与进度", data="m:tasks")],
-            [Button.inline("📡 监控任务（已配置）", data="m:monitors")],
+            [Button.inline("👁 新建持续监听", data="m:new:monitor")],
+            [Button.inline("📋 克隆任务列表", data="m:tasks")],
+            [Button.inline("📡 监听任务列表", data="m:monitors")],
             [Button.inline("💾 备份数据库", data="m:backup"),
              Button.inline("⚙️ 限流设置", data="m:settings")],
-            [Button.inline("❓ 使用说明", data="m:help")],
+            [Button.inline("❓ 命令与说明", data="m:help")],
         ]
         return text, buttons
 
@@ -285,7 +288,11 @@ class MenuController:
                 lines.append(f"预计: {human_count(total)} 条消息")
         lines.append(f"模式: {'复制' if mode == 'copy' else '转发'}")
         lines.append("")
-        lines.append("点「开始」后会在后台运行，可随时在「我的任务」里暂停/继续。")
+        if wiz.kind == "monitor":
+            lines.append("点「开始」后立即开始监听新消息，源频道必须是 UserBot 已加入的。")
+        else:
+            lines.append("点「开始」后会在后台运行；跑完默认转成持续监听，"
+                         "可在任务详情里关闭。")
         buttons = [
             [Button.inline("🚀 开始", data="m:go")],
             [Button.inline("« 上一步", data="m:back"),
@@ -313,21 +320,31 @@ class MenuController:
         return "—"
 
     async def render_tasks(self, event, edit: bool = True):
-        tasks = await models.get_all_active_tasks(self.db)
+        """克隆任务列表：已完成的也保留，并标出是否在持续监听。"""
+        tasks = await models.get_tasks_for_list(
+            self.db, models.CLONE_TASK_TYPES, limit=12)
         if not tasks:
-            text = "📭 还没有任务\n\n点「新建克隆任务」创建第一个。"
+            text = ("📭 还没有克隆任务\n\n"
+                    "点「新建克隆任务」创建第一个，或用 /kl <频道链接>。")
             buttons = [[Button.inline("📥 新建克隆任务", data="m:new:clone")],
                        [Button.inline("« 主菜单", data="m:home")]]
         else:
-            text = f"📋 任务列表（{len(tasks)} 个）\n点一项查看详情与操作"
+            running = sum(1 for t in tasks if t["status"] == "running")
+            following = sum(1 for t in tasks if int(t.get("follow") or 0))
+            text = (f"📋 克隆任务（{len(tasks)} 个 · 运行中 {running} · "
+                    f"持续监听 {following}）\n"
+                    "已完成的记录会一直保留，点一项可看详情、开关持续监听。")
             buttons = []
             for t in tasks[:12]:
                 status = STATUS_EMOJI.get(t["status"], "❓")
                 name = t.get("source_title") or str(t["source_chat_id"])
-                label = f"{status}{self._task_icon(t)} #{t['id']} {name} {self._pct_text(t)}"
+                follow = "🛰" if int(t.get("follow") or 0) else ""
+                label = (f"{status}📥{follow} #{t['id']} {name} "
+                         f"{self._pct_text(t)}")
                 buttons.append([Button.inline(label[:52], data=f"m:task:{t['id']}")])
             buttons.append([Button.inline("🔄 刷新", data="m:tasks"),
-                            Button.inline("« 主菜单", data="m:home")])
+                            Button.inline("📡 监听列表", data="m:monitors")])
+            buttons.append([Button.inline("« 主菜单", data="m:home")])
         if edit:
             try:
                 await event.edit(text, buttons=buttons)
@@ -360,9 +377,8 @@ class MenuController:
         return out
 
     async def render_monitors(self, event, edit: bool = True):
-        """实时监控任务总览：看得到设置了哪些监控、各自转发了多少。"""
-        tasks = [t for t in await models.get_all_active_tasks(self.db)
-                 if t["type"] == "monitor"]
+        """监听任务总览：看得到设置了哪些监听、各自转发了多少。"""
+        tasks = await models.get_tasks_by_type(self.db, "monitor")
         if not tasks:
             text = ("📡 还没有实时监控任务\n\n"
                     "监控会把源频道的新消息实时转发到目标，"
@@ -372,14 +388,16 @@ class MenuController:
                        [Button.inline("« 主菜单", data="m:home")]]
         else:
             running = sum(1 for t in tasks if t["status"] == "running")
-            lines = [f"📡 实时监控任务（共 {len(tasks)} 个，运行中 {running} 个）", ""]
+            lines = [f"📡 监听任务（共 {len(tasks)} 个，运行中 {running} 个）", ""]
             for t in tasks[:10]:
                 stats = await self._monitor_stats(t)
                 status = STATUS_EMOJI.get(t["status"], "❓")
                 src = t.get("source_title") or str(t["source_chat_id"])
                 tgt = t.get("target_title") or str(t["target_chat_id"])
                 scope = f"话题 #{t['source_topic_id']}" if t.get("source_topic_id") else "全部消息"
-                lines.append(f"{status} #{t['id']} {src}（{scope}）")
+                origin = (f"（来自克隆任务 #{t['parent_id']}）"
+                          if t.get("parent_id") else "")
+                lines.append(f"{status} #{t['id']} {src}（{scope}）{origin}")
                 lines.append(f"   → {tgt}")
                 lines.append(f"   已转发 {stats['done']:,} · 失败 {stats['fail']} · 跳过 {stats['skip']}")
                 if stats.get("last_msg_id"):
@@ -436,6 +454,11 @@ class MenuController:
             lines.append(
                 f"成功 {done:,} · 失败 {int(t.get('fail_count') or 0):,}"
                 f" · 跳过 {int(t.get('skip_count') or 0):,}")
+            follow_on = bool(int(t.get("follow") or 0))
+            mid = int(t.get("follow_task_id") or 0)
+            follow_text = ("🛰 开启" + (f"（监听任务 #{mid}）" if mid else "")
+                           if follow_on else "⏹ 关闭")
+            lines.append(f"持续监听: {follow_text}")
         else:
             stats = await self._monitor_stats(t)
             scope = (f"仅话题 #{t['source_topic_id']}"
@@ -457,9 +480,17 @@ class MenuController:
         if t["status"] == "running":
             buttons.append([Button.inline("⏸ 暂停", data=f"m:pause:{t['id']}")])
         elif t["status"] in ("paused", "failed"):
-            resume_label = ("▶️ 继续监控" if t["type"] not in models.CLONE_TASK_TYPES
+            resume_label = ("▶️ 继续监听" if t["type"] not in models.CLONE_TASK_TYPES
                             else "▶️ 继续克隆")
             buttons.append([Button.inline(resume_label, data=f"m:resume:{t['id']}")])
+        elif t["status"] == "completed" and t["type"] in models.CLONE_TASK_TYPES:
+            buttons.append([Button.inline("🔁 继续补新消息",
+                                          data=f"m:cont:{t['id']}")])
+        if t["type"] in models.CLONE_TASK_TYPES:
+            follow_on = bool(int(t.get("follow") or 0))
+            buttons.append([Button.inline(
+                "⏹ 关闭持续监听" if follow_on else "🛰 开启持续监听",
+                data=f"m:follow:{t['id']}")])
         buttons.append([Button.inline("🔄 刷新", data=f"m:task:{t['id']}")])
         buttons.append([Button.inline("🗑 删除", data=f"m:del:{t['id']}"),
                         Button.inline("« 任务列表", data="m:tasks")])
@@ -514,6 +545,11 @@ class MenuController:
                 return
             if not await self._is_admin(event):
                 self.drop(event.chat_id, event.sender_id)
+                # 之前是静默丢弃，用户会以为「机器人没反应」，这里明确回一条
+                try:
+                    await event.reply("⛔ 无权限：只有配置里的管理员可以创建/管理任务。")
+                except Exception:
+                    pass
                 return
             try:
                 await self._on_text(event, wiz)
@@ -591,6 +627,27 @@ class MenuController:
             await self.render_task_detail(event, int(action.split(":")[1]))
             return
 
+        if action.startswith("follow:"):
+            task_id = int(action.split(":")[1])
+            if not self._toggle_follow:
+                await event.answer("当前版本不支持持续监听", alert=True)
+                return
+            ok, msg = await self._toggle_follow(task_id)
+            await event.answer(msg, alert=not ok)
+            await self.render_task_detail(event, task_id)
+            return
+
+        if action.startswith("cont:"):
+            task_id = int(action.split(":")[1])
+            if not self._continue_task:
+                await event.answer("当前版本不支持继续克隆", alert=True)
+                return
+            ok, err = await self._continue_task(task_id)
+            await event.answer("🔁 已继续，只补新消息" if ok else (err or "继续失败"),
+                               alert=not ok)
+            await self.render_task_detail(event, task_id)
+            return
+
         if action.split(":", 1)[0] in ("pause", "resume", "del"):
             verb, _, raw_id = action.partition(":")
             task_id = int(raw_id)
@@ -603,8 +660,8 @@ class MenuController:
                 await event.answer("▶️ 已继续" if ok else (err or "无法继续"), alert=not ok)
             else:
                 await self._stop_task(task_id)
-                await models.update_task_status(self.db, task_id, "completed")
-                await event.answer(f"🗑 任务 #{task_id} 已删除")
+                await models.update_task_status(self.db, task_id, "deleted")
+                await event.answer(f"🗑 任务 #{task_id} 已删除（记录已移除）")
                 await self.render_tasks(event)
                 return
             await self.render_task_detail(event, task_id)
@@ -637,16 +694,21 @@ class MenuController:
 
         if action == "help":
             text = (
-                "❓ 使用说明\n\n"
-                "1️⃣ 点「新建克隆任务」，发送源频道链接\n"
-                "2️⃣ 选起点：从头 / 指定消息 ID / 指定时间 / 继续上次\n"
-                "3️⃣ 选目标：当前会话，或发目标频道链接\n"
-                "4️⃣ 选模式：复制（无来源标记）或转发\n"
-                "5️⃣ 确认后后台运行，可在「我的任务」暂停/继续\n\n"
-                "💡 克隆会一直跑到源的最新一条；中途断了也能接着跑。\n"
+                "❓ 命令与功能对照\n\n"
+                "【克隆 / 监听】\n"
+                "/kl <链接> — 克隆全部消息，完成后自动持续监听\n"
+                "/kl 100-1100 <链接> — 只克隆 msg 100~1100\n"
+                "/kljx <链接> — 接着上次进度补到最新，不重复\n"
+                "/jt <链接> — 只监听新消息\n"
+                "/kllb — 克隆任务列表（含已完成）\n"
+                "/jtlb — 监听任务列表\n\n"
+                "【工具】\n"
+                "/chapd — 转发一条频道消息，识别来源频道\n"
+                "/start — 打开本菜单\n\n"
+                "💡 克隆任务记录会永久保留，跑完后默认转成持续监听，\n"
+                "   在任务详情里可以随时开关「🛰 持续监听」。\n"
                 "💡 目标频道需要先把 Bot 设为管理员。\n"
-                "💡 克隆进度存在 data/bot.db，点「备份数据库」可随时导出快照。\n"
-                "💡 老命令 /sync、/syncrestrictedmsg 仍然可用。"
+                "💡 进度存在 data/bot.db，点「备份数据库」可导出快照。"
             )
             await event.edit(text, buttons=[[Button.inline("« 主菜单", data="m:home")]])
             return
@@ -839,7 +901,23 @@ class MenuController:
         )
         task_id, err = await self._create_task(payload, event)
         if not task_id:
+            # 不光弹 toast，还要在会话里留一条可见的失败原因（toast 很容易被忽略）
             await event.answer(err or "创建失败", alert=True)
+            text = (
+                "❌ 创建任务失败\n\n"
+                f"原因: {err or '未知错误'}\n\n"
+                "常见原因：\n"
+                "• UserBot 还没加入源频道（监听必须有读权限）\n"
+                "• Bot 不是目标频道管理员，无法发送\n"
+                "• 链接失效或频道已转为私有"
+            )
+            try:
+                await event.edit(text, buttons=[
+                    [Button.inline("🔁 重试", data="m:go")],
+                    [Button.inline("« 主菜单", data="m:home")]])
+            except Exception:
+                await event.respond(text)
+            logger.warning("菜单创建任务失败 kind=%s: %s", wiz.kind, err)
             return
 
         # 已存在相同的监控任务：不重复创建，直接把已有任务展示出来

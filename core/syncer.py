@@ -52,6 +52,7 @@ class ClonePlan:
     resumed: bool
     start_desc: str
     done_before: int
+    end_msg_id: int = 0
 
     def summary(self, task_id: int) -> str:
         head = "🔁 继续克隆任务" if self.resumed else "🚀 开始克隆任务"
@@ -71,6 +72,8 @@ class Syncer(ForwardingComponent):
         self.batch_size = max(1, int(clone_cfg.get("batch_size") or DEFAULT_BATCH_SIZE))
         self.progress_every = max(1, int(
             clone_cfg.get("progress_notify_every") or DEFAULT_PROGRESS_EVERY))
+        # 克隆完成后回调（handlers 注入：默认自动开启持续监听）
+        self.on_complete: Callable[[int], Awaitable[None]] | None = None
 
     # ------------------------------------------------------------------
     # 起点解析
@@ -90,12 +93,23 @@ class Syncer(ForwardingComponent):
         return int(getattr(msg, "id", 0) or 0)
 
     async def _count_remaining(self, client: TelegramClient, chat_id: int,
-                               topic_id: int | None, offset_id: int) -> int | None:
+                               topic_id: int | None, offset_id: int,
+                               max_id: int = 0) -> int | None:
         """统计游标之后还剩多少条（服务端 count，不拉消息体）。"""
         try:
             msgs = await client.get_messages(
-                chat_id, limit=1, reply_to=topic_id, min_id=max(0, offset_id))
+                chat_id, limit=1, reply_to=topic_id, min_id=max(0, offset_id),
+                max_id=max_id or 0)
             return getattr(msgs, "total", None)
+        except TypeError:
+            # 极老版本 Telethon 不接受 max_id=0
+            try:
+                msgs = await client.get_messages(
+                    chat_id, limit=1, reply_to=topic_id, min_id=max(0, offset_id))
+                return getattr(msgs, "total", None)
+            except Exception as e:
+                logger.debug("统计剩余消息数失败 chat=%s: %s", chat_id, e)
+                return None
         except Exception as e:
             logger.debug("统计剩余消息数失败 chat=%s: %s", chat_id, e)
             return None
@@ -105,6 +119,7 @@ class Syncer(ForwardingComponent):
         """根据任务配置与已有进度计算本次运行的起点。"""
         last = int(task.get("last_synced_msg_id") or 0)
         start_msg_id = int(task.get("start_msg_id") or 0)
+        end_msg_id = int(task.get("end_msg_id") or 0)
         done_before = int(task.get("done_count") or 0)
 
         if last > 0:
@@ -127,7 +142,12 @@ class Syncer(ForwardingComponent):
             resumed = False
             start_desc = describe_start()
 
-        remaining = await self._count_remaining(client, chat_id, topic_id, offset_id)
+        if end_msg_id:
+            start_desc = f"{start_desc} → 到消息 {end_msg_id} 为止"
+
+        remaining = await self._count_remaining(
+            client, chat_id, topic_id, offset_id,
+            max_id=(end_msg_id + 1) if end_msg_id else 0)
         total = None
         if remaining is not None:
             total = remaining + (done_before if resumed else 0)
@@ -135,7 +155,8 @@ class Syncer(ForwardingComponent):
             total = int(task["total_count"])
 
         return ClonePlan(offset_id=offset_id, total=total, resumed=resumed,
-                         start_desc=start_desc, done_before=done_before)
+                         start_desc=start_desc, done_before=done_before,
+                         end_msg_id=end_msg_id)
 
     # ------------------------------------------------------------------
     # 分批流式读取
@@ -147,11 +168,16 @@ class Syncer(ForwardingComponent):
 
     async def _iter_batches(self, task_id: int, client: TelegramClient,
                             chat_id: int, topic_id: int | None, offset_id: int,
-                            counter: dict):
+                            counter: dict, end_msg_id: int = 0):
         """按批产出消息列表；相册不会被切到两批。"""
         buffer: list = []
+        kwargs = {}
+        if end_msg_id:
+            # max_id 为排他上界，+1 保证 end_msg_id 这一条也被克隆
+            kwargs["max_id"] = end_msg_id + 1
         async for msg in client.iter_messages(
             chat_id, reverse=True, offset_id=offset_id, reply_to=topic_id,
+            **kwargs,
         ):
             if self._cancel_flags.get(task_id):
                 break
@@ -395,6 +421,7 @@ class Syncer(ForwardingComponent):
                     async for batch in self._iter_batches(
                         task_id, active_userbot, source_chat_id,
                         source_topic_id, cursor, counter,
+                        end_msg_id=plan.end_msg_id,
                     ):
                         if self._cancel_flags.get(task_id):
                             break
@@ -537,3 +564,10 @@ class Syncer(ForwardingComponent):
             f"{restricted_line}"
             f"\n• 失败: {failed:,} 条 · 跳过: {skipped:,} 条"
             f"\n• 最终游标: msg_id={cursor}")
+
+        # 完成后默认转「持续监听」（handlers 注入的钩子，未设置则什么都不做）
+        if self.on_complete is not None:
+            try:
+                await self.on_complete(task_id)
+            except Exception as e:
+                logger.warning("克隆任务 #%s 完成后开启持续监听失败: %s", task_id, e)

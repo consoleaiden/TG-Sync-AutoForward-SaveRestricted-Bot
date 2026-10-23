@@ -142,7 +142,8 @@ class MenuFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.menu.show_main_menu(ev)
         names = labels(ev.sent[-1][1])
         self.assertTrue(any("克隆" in n for n in names), names)
-        self.assertTrue(any("我的任务" in n for n in names), names)
+        self.assertTrue(any("克隆任务列表" in n for n in names), names)
+        self.assertTrue(any("监听任务列表" in n for n in names), names)
 
     async def test_create_clone_from_head(self):
         ev = FakeEvent()

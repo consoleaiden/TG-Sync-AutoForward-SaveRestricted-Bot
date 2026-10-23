@@ -8,8 +8,9 @@ import asyncio
 import html
 import logging
 import re
+import time
 
-from telethon import TelegramClient, events, errors, Button
+from telethon import TelegramClient, events, errors, Button, utils
 from telethon.tl import types
 from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
 
@@ -46,6 +47,96 @@ from db.database import Database
 from db import models
 
 logger = logging.getLogger("tg_forward_bot.handlers")
+
+# `/kl 100-1100 <链接>` 的 ID 区间（支持 - ~ — 到 至）
+_RANGE_RE = re.compile(r"^(\d{1,12})\s*(?:-|~|—|到|至)\s*(\d{1,12})(?!\d)")
+# /chapd 的「等一条转发消息」有效期
+CHAPD_TTL = 10 * 60
+
+
+def parse_clone_args(raw: str) -> tuple[int, int, str, str | None]:
+    """解析 `/kl 100-1100 <链接>`：返回 (起始ID, 结束ID, 剩余文本, 描述)。"""
+    text = (raw or "").strip()
+    start = end = 0
+    desc = None
+    m = _RANGE_RE.match(text)
+    if m:
+        start, end = int(m.group(1)), int(m.group(2))
+        if start > end:
+            start, end = end, start
+        desc = f"从消息 {start} 到 {end}"
+        text = text[m.end():].strip()
+    return start, end, text, desc
+
+
+def strip_command(raw: str, name: str) -> str:
+    """去掉开头的 /name 或 /name@bot，保留参数部分。"""
+    return re.sub(rf"^/{name}(?:@\w+)?\s*", "", raw or "", count=1).strip()
+
+
+def describe_forwarded_source(msg) -> dict | None:
+    """从转发消息里提取来源频道（名称 / 用户名 / ID / 链接）。"""
+    hdr = getattr(msg, "fwd_from", None)
+    fwd = getattr(msg, "forward", None)
+    chat = getattr(fwd, "chat", None) if fwd else None
+
+    chat_id = None
+    if chat is not None:
+        try:
+            chat_id = utils.get_peer_id(chat)
+        except Exception:
+            chat_id = getattr(chat, "id", None)
+    if chat_id is None and hdr is not None:
+        peer = getattr(hdr, "from_id", None) or getattr(hdr, "saved_from_peer", None)
+        if peer is not None:
+            try:
+                chat_id = utils.get_peer_id(peer)
+            except Exception:
+                chat_id = None
+    if chat_id is None:
+        return None
+
+    title = (getattr(chat, "title", None)
+             or getattr(hdr, "from_name", None) or "未知频道")
+    username = getattr(chat, "username", None)
+    if username:
+        link = f"https://t.me/{username}"
+    else:
+        try:
+            real_id = utils.resolve_id(int(chat_id))[0]
+        except Exception:
+            real_id = abs(int(chat_id))
+        link = f"https://t.me/c/{real_id}/1"
+    return {"chat_id": int(chat_id), "title": title,
+            "username": username, "link": link}
+
+
+
+async def latest_source_msg_id(source_id: int, topic_id=None, *clients) -> int | None:
+    """取源（含话题）最新一条消息 ID；无法判定时返回 ``None``。
+
+    ``None`` 表示"查不到"（客户端无权限 / 网络异常），调用方必须按"无法判断"处理，
+    不能当成"没有新消息"，否则 `/kljx` 会误判成已是最新而漏补。
+
+    多个客户端按顺序尝试（通常是 解析源时选中的 UserBot → 默认 UserBot → Bot），
+    第一个能拿到结果的即为答案；源为空时返回 ``0``。
+    """
+    for c in clients:
+        if not c:
+            continue
+        try:
+            msgs = await c.get_messages(source_id, limit=1, reply_to=topic_id)
+        except Exception as e:
+            logger.debug("取源最新消息失败 source=%s: %s", source_id, e)
+            continue
+        if msgs is None:
+            continue
+        items = list(msgs)
+        if not items:
+            return 0
+        mid = getattr(items[0], "id", None)
+        return int(mid) if mid else 0
+    return None
 
 
 class HandlerRuntime:
@@ -356,10 +447,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         for t in tasks:
             emoji = "🔄" if t["type"] in ("sync", "sync_restricted") else "👁"
             status = STATUS_EMOJI.get(t["status"], "❓")
+            follow = "🛰" if int(t.get("follow") or 0) else ""
             src = await _format_chat_topic_display(
                 t["source_chat_id"], t["source_topic_id"], short=True
             )
-            label = f"{status}{emoji} #{t['id']} {src}"
+            label = f"{status}{emoji}{follow} #{t['id']} {src}"
             buttons.append([Button.inline(truncate(label, 48), data=f"task:{t['id']}")])
         buttons.append([Button.inline("🗑 清空所有任务", data="clear_all")])
         return buttons
@@ -403,6 +495,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                                  target_topic_id: int | None = None,
                                  start_msg_id: int = 0,
                                  start_date: str | None = None,
+                                 end_msg_id: int = 0,
+                                 follow: int = 0,
                                  source_title: str | None = None,
                                  target_title: str | None = None,
                                  notify_chat_id: int | None = None,
@@ -416,6 +510,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             target_topic_id=target_topic_id,
             start_msg_id=start_msg_id,
             start_date=start_date,
+            end_msg_id=end_msg_id,
+            follow=follow,
             source_title=source_title,
             target_title=target_title,
             notify_chat_id=notify_chat_id,
@@ -427,8 +523,10 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             f"🎯 目标: {target_title or target_chat_id}",
             f"📍 起点: {start_desc}",
             f"📋 模式: {mode}",
-            "⏳ 正在统计待克隆消息数量…",
         ]
+        if follow:
+            lines.append("🛰 完成后会自动开启「持续监听」，后续新消息继续克隆")
+        lines.append("⏳ 正在统计待克隆消息数量…")
         notify_msg_id = None
         try:
             msg = await bot.send_message(
@@ -449,7 +547,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             notify_msg_id=notify_msg_id, userbot=userbot)
         return task_id
 
-    async def _resume_clone(task_id: int) -> tuple[bool, str | None]:
+    async def _resume_clone(task_id: int, *, allow_completed: bool = False
+                            ) -> tuple[bool, str | None]:
         """从游标继续一个未完成的克隆/监控任务。"""
         t = await models.get_task(db, task_id)
         if not t:
@@ -467,7 +566,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             logger.info("监控任务 #%s 已恢复", task_id)
             return True, None
 
-        if int(t.get("last_synced_msg_id") or 0) <= 0 and t["status"] == "completed":
+        if (int(t.get("last_synced_msg_id") or 0) <= 0
+                and t["status"] == "completed" and not allow_completed):
             return False, "该任务已完成，无需继续"
 
         await models.update_task_status(db, task_id, "running")
@@ -493,6 +593,141 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return
         if t["status"] == "running":
             await _stop_running_task(t)
+
+    # ------------------------------------------------------------------
+    # 持续监听（克隆完成后默认开启，可在任务详情里开关）
+    # ------------------------------------------------------------------
+
+    async def _notify_simple(task: dict, text: str) -> None:
+        chat_id = task.get("notify_chat_id") or task.get("target_chat_id")
+        if not chat_id:
+            return
+        try:
+            await bot.send_message(
+                chat_id, text, reply_to=task.get("target_topic_id") or None)
+        except Exception as e:
+            logger.warning("发送任务通知失败 task=%s: %s", task.get("id"), e)
+
+    async def _notify_follow(clone_task: dict, monitor_id: int, *, reason: str) -> None:
+        src = clone_task.get("source_title") or clone_task["source_chat_id"]
+        tgt = clone_task.get("target_title") or clone_task["target_chat_id"]
+        text = (f"🛰 {reason}\n"
+                f"克隆任务 #{clone_task['id']} 会继续监听后续新消息"
+                f"（监听任务 #{monitor_id}）\n"
+                f"📌 源: {src}\n🎯 目标: {tgt}\n\n"
+                "不需要继续跟新时可点下面的按钮关闭，克隆记录会保留。")
+        chat_id = clone_task.get("notify_chat_id") or clone_task["target_chat_id"]
+        try:
+            await bot.send_message(
+                chat_id, text, reply_to=clone_task.get("target_topic_id") or None,
+                buttons=[[Button.inline("🛰 关闭持续监听",
+                                        data=f"m:follow:{clone_task['id']}"),
+                          Button.inline("📋 任务列表", data="m:tasks")]])
+        except Exception as e:
+            logger.warning("发送持续监听提示失败 clone=%s: %s", clone_task.get("id"), e)
+
+    async def _ensure_follow_monitor(clone_task_id: int, *, notify: bool = True,
+                                     reason: str = "已开启持续监听"
+                                     ) -> tuple[int | None, str | None]:
+        """确保克隆任务对应的监听任务在运行；返回 (monitor_task_id, err)。"""
+        t = await models.get_task(db, clone_task_id)
+        if not t:
+            return None, "任务不存在"
+        if t["type"] not in models.CLONE_TASK_TYPES:
+            return None, "只有克隆任务可以开启持续监听"
+
+        existing = await models.find_follow_task(db, t)
+        if existing:
+            if existing["status"] != "running":
+                ok, why, ub = await _ensure_userbot_joined_source_for_monitor(
+                    existing["source_chat_id"], existing["source_topic_id"])
+                if not ok:
+                    return existing["id"], truncate(
+                        (why or "UserBot 未加入源").replace("\n", " "), 150)
+                await models.update_task_status(db, existing["id"], "running")
+                await monitor_manager.start_monitor(
+                    existing["id"], existing["source_chat_id"],
+                    existing["target_chat_id"], existing["mode"],
+                    existing["source_topic_id"], existing["target_topic_id"],
+                    userbot=ub)
+                if notify:
+                    await _notify_follow(t, existing["id"], reason="已恢复持续监听")
+            await models.set_follow(db, clone_task_id, 1, existing["id"])
+            return existing["id"], None
+
+        ok, why, ub = await _ensure_userbot_joined_source_for_monitor(
+            t["source_chat_id"], t.get("source_topic_id"))
+        if not ok:
+            return None, truncate((why or "UserBot 未加入源").replace("\n", " "), 150)
+
+        mid, err, _created = await _create_monitor_task(
+            source_id=t["source_chat_id"],
+            target_chat_id=t["target_chat_id"],
+            mode=t["mode"],
+            source_topic_id=t.get("source_topic_id"),
+            target_topic_id=t.get("target_topic_id"),
+            source_title=t.get("source_title"),
+            target_title=t.get("target_title"),
+            notify_chat_id=t.get("notify_chat_id") or t["target_chat_id"],
+            created_by=t.get("created_by"),
+            parent_id=clone_task_id,
+            userbot=ub)
+        if not mid:
+            return None, err or "创建监听任务失败"
+        await models.set_follow(db, clone_task_id, 1, mid)
+        if notify:
+            await _notify_follow(t, mid, reason=reason)
+        return mid, None
+
+    async def _toggle_follow(clone_task_id: int) -> tuple[bool, str]:
+        """任务详情按钮：开启 / 关闭某个克隆任务的持续监听。"""
+        t = await models.get_task(db, clone_task_id)
+        if not t:
+            return False, "任务不存在"
+        if t["type"] not in models.CLONE_TASK_TYPES:
+            return False, "只有克隆任务支持持续监听"
+
+        follow_on = bool(int(t.get("follow") or 0))
+        monitor = await models.find_follow_task(db, t)
+        if follow_on and monitor and monitor.get("status") == "running":
+            await _stop_running_task(monitor)
+            await models.set_follow(db, clone_task_id, 0)
+            return True, f"🛰 已关闭持续监听（监听任务 #{monitor['id']} 已暂停，记录保留）"
+
+        mid, err = await _ensure_follow_monitor(clone_task_id, notify=False)
+        if not mid:
+            return False, err or "开启持续监听失败"
+        return True, f"🛰 已开启持续监听（监听任务 #{mid}）"
+
+    async def _continue_clone(task_id: int) -> tuple[bool, str | None]:
+        """「继续补新消息」：已完成的任务重开（保留游标），未完成的直接续传。"""
+        t = await models.get_task(db, task_id)
+        if not t:
+            return False, "任务不存在"
+        if t["status"] == "completed":
+            await models.reopen_clone_task(
+                db, task_id, follow=int(t.get("follow") or 0), clear_end=True)
+        ok, err = await _resume_clone(task_id, allow_completed=True)
+        if not ok:
+            await models.update_task_status(db, task_id, "paused")
+        return ok, err
+
+    async def _on_clone_completed(clone_task_id: int) -> None:
+        """克隆跑完后的默认动作：转成持续监听。"""
+        cfg = config.get("clone") or {}
+        if not cfg.get("follow_after_finish", True):
+            return
+        t = await models.get_task(db, clone_task_id) or {}
+        if not int(t.get("follow") or 0):
+            return
+        mid, err = await _ensure_follow_monitor(clone_task_id, notify=False)
+        if mid:
+            await _notify_follow(t, mid, reason="✅ 克隆完成，已自动转为持续监听")
+        elif err:
+            logger.warning("克隆任务 #%s 完成后开启持续监听失败: %s", clone_task_id, err)
+            await _notify_simple(
+                t, f"⚠️ 克隆已完成，但持续监听未开启：{err}\n"
+                   f"可在「📋 任务列表」里点任务 #{clone_task_id} 手动重试。")
 
     # ------------------------------------------------------------------
     # 菜单回调：把网络/业务细节收敛在这里，菜单只负责交互
@@ -583,6 +818,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                                    target_title: str | None = None,
                                    notify_chat_id: int | None = None,
                                    created_by: int | None = None,
+                                   parent_id: int | None = None,
                                    userbot: TelegramClient | None = None,
                                    ) -> tuple[int | None, str | None, bool]:
         """建监控任务 → 去重 → 发确认消息 → 注册监听。
@@ -604,7 +840,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             source_title=source_title,
             target_title=target_title,
             notify_chat_id=notify_chat_id,
-            created_by=created_by)
+            created_by=created_by,
+            parent_id=parent_id)
         await monitor_manager.start_monitor(
             task_id, source_id, target_chat_id, mode,
             source_topic_id=source_topic_id,
@@ -689,6 +926,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             target_topic_id=target_topic_id,
             start_msg_id=int(start.get("msg_id") or 0),
             start_date=start.get("date"),
+            end_msg_id=int(start.get("end_msg_id") or 0),
+            follow=1,          # 菜单建的克隆任务默认持续监听后续新消息
             source_title=payload.get("source_title"),
             target_title=payload.get("target_title"),
             notify_chat_id=payload.get("chat_id"),
@@ -723,6 +962,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             logger.info("已自动续传 %d 个克隆任务", resumed)
         return resumed, failed
 
+    # 克隆完成 → 默认转「持续监听」（config.clone.follow_after_finish 可关）
+    syncer.on_complete = _on_clone_completed
+
     menu = MenuController(
         bot,
         db=db,
@@ -736,6 +978,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         create_task=_menu_create_task,
         stop_task=_stop_task,
         resume_task=_resume_clone,
+        toggle_follow=_toggle_follow,
+        continue_task=_continue_clone,
         monitor_manager=monitor_manager,
     )
     menu.register()
@@ -986,22 +1230,31 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     @bot.on(events.NewMessage(pattern=r"/help(?:@\w+)?$"))
     async def on_help(event):
         await event.reply(
-            "📖 使用说明（推荐直接点菜单操作）\n\n"
-            "按钮菜单：/start 或 /menu\n"
-            "• 📥 新建克隆任务 — 选源 → 选目标 → 选起点 → 开始\n"
-            "• 📋 我的任务 — 查看进度、暂停、继续、删除\n\n"
-            "命令（仍然可用）：\n"
+            "📖 命令与功能对照\n\n"
+            "【克隆 / 监听】\n"
+            "/kl <链接> — 克隆该频道全部消息到本群，完成后自动持续监听\n"
+            "/kl 100-1100 <链接> — 只克隆 msg 100~1100（含两端）\n"
+            "/kljx <链接> — 接着上次进度补到最新，已克隆过的不会重复\n"
+            "/jt <链接> — 只监听新消息（不克隆历史）\n"
+            "/kllb — 克隆任务列表（含已完成，记录永久保留）\n"
+            "/jtlb — 监听任务列表\n\n"
+            "【工具】\n"
+            "/chapd — 转发一条频道消息到本群，识别来源频道名称/ID/链接\n"
+            "/start 或 /menu — 按钮菜单（推荐，含进度、暂停、继续、开关持续监听）\n"
+            "/settings — 查看限流与数据存储状态\n"
+            "/help — 本说明\n\n"
+            "【兼容旧命令】\n"
             "/clone [链接] — 进入克隆向导\n"
             "/sync <链接> [--forward] [--from-id N] [--from-time 2024-01-31]\n"
-            "/syncrestrictedmsg <链接> — 通过 Takeout 补发受限消息\n"
-            "/takeout <链接> — 通过 Takeout 解析单条消息/相册\n"
-            "/monitor <链接> [--forward] — 监控源新消息\n"
-            "/list — 任务列表（含暂停/恢复/删除）\n"
-            "/settings — 查看限流配置\n\n"
-            "链接格式:\n"
-            "• https://t.me/channel/123\n"
-            "• https://t.me/c/123456/789\n"
-            "• https://t.me/c/123456/3/962 (话题)")
+            "/syncrestrictedmsg <链接> — Takeout 补发受限消息\n"
+            "/takeout <链接> — Takeout 解析单条消息/相册\n"
+            "/monitor <链接> — 同 /jt\n"
+            "/list — 任务列表\n\n"
+            "链接格式：\n"
+            "• https://t.me/channel 或 @channel\n"
+            "• https://t.me/channel/123（从该条起）\n"
+            "• https://t.me/c/123456/789（私有频道）\n"
+            "• -1001234567890（直接用频道 ID）")
 
     @bot.on(events.NewMessage(pattern=r"^/clone(?:@\w+)?(?:\s+(.+))?$"))
     async def on_clone(event):
@@ -1010,6 +1263,232 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return
         raw = (event.pattern_match.group(1) or "").strip()
         await menu.start_wizard_via_command(event, "clone", raw or None)
+
+    # ------------------------------------------------------------------
+    # 新版命令族：/kl /jt /kllb /jtlb /kljx /chapd
+    # ------------------------------------------------------------------
+
+    _chapd_wait: dict[tuple[int, int], float] = {}
+
+    async def _resolve_cmd_source(event, raw: str):
+        """命令里解析源：复用菜单的解析逻辑，错误直接回复用户。"""
+        link = extract_tg_link(raw) or raw.strip()
+        if not link:
+            await event.reply("❌ 请提供频道链接或 @用户名")
+            return None
+        info, err = await _menu_resolve_source(event, link)
+        if not info:
+            await event.reply(f"❌ {err or '无法解析该频道'}")
+            return None
+        return info
+
+    async def _latest_source_msg_id(source_id: int, topic_id=None,
+                                    client=None) -> int | None:
+        """取源（含话题）最新一条消息 ID；无法判定时返回 None。
+
+        None 表示"查不到"（客户端无权限/网络异常），调用方应按"无法判断"处理，
+        不能当成"没有新消息"，否则会误判成已是最新而漏补。
+        """
+        return await latest_source_msg_id(source_id, topic_id, client, userbot, bot)
+
+    @bot.on(events.NewMessage(pattern=r"^/kl(?:@\w+)?(?=\s|$)"))
+    async def on_kl(event):
+        """`/kl <链接>` 克隆全部；`/kl 100-1100 <链接>` 只克隆区间；完成后持续监听。"""
+        if not await _require_admin(event):
+            return
+        raw = strip_command(event.raw_text, "kl")
+        start_id, end_id, rest, range_desc = parse_clone_args(raw)
+        if not rest:
+            await event.reply(
+                "用法：\n"
+                "• `/kl https://t.me/xxx` — 克隆该频道全部消息，完成后持续监听\n"
+                "• `/kl 100-1100 https://t.me/xxx` — 只克隆 msg 100~1100\n"
+                "• `/kljx https://t.me/xxx` — 接着上次进度补到最新（不重复）")
+            return
+
+        info = await _resolve_cmd_source(event, rest)
+        if not info:
+            return
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+        target_title = await _format_chat_topic_display(
+            target_chat_id, target_topic_id, prefer_bot=True)
+        start_desc = range_desc or "从头开始（最早 → 最新）"
+
+        task_id = await _create_clone_task(
+            source_id=info["chat_id"],
+            target_chat_id=target_chat_id,
+            mode="copy",
+            source_topic_id=info.get("topic_id"),
+            target_topic_id=target_topic_id,
+            start_msg_id=start_id,
+            end_msg_id=end_id,
+            follow=1,
+            source_title=info.get("title"),
+            target_title=target_title,
+            notify_chat_id=event.chat_id,
+            created_by=event.sender_id,
+            userbot=info.get("userbot"),
+            start_desc=start_desc,
+        )
+        await event.reply(
+            f"✅ 克隆任务 #{task_id} 已创建\n"
+            f"📌 源: {info.get('title')}\n"
+            f"📍 范围: {start_desc}\n"
+            f"🛰 跑完后自动持续监听新消息（可在任务详情里关闭）",
+            buttons=[[Button.inline("📋 任务详情", data=f"m:task:{task_id}"),
+                      Button.inline("📥 克隆列表", data="m:tasks")]])
+
+    @bot.on(events.NewMessage(pattern=r"^/jt(?:@\w+)?(?=\s|$)"))
+    async def on_jt(event):
+        """`/jt <链接>` 只监听新消息，不克隆历史。"""
+        if not await _require_admin(event):
+            return
+        raw = strip_command(event.raw_text, "jt")
+        if not raw:
+            await event.reply("用法：`/jt https://t.me/xxx` — 只监听该频道的新消息并克隆到本群")
+            return
+        info = await _resolve_cmd_source(event, raw)
+        if not info:
+            return
+
+        ok, reason, ub = await _ensure_userbot_joined_source_for_monitor(
+            info["chat_id"], info.get("topic_id"))
+        if not ok:
+            await event.reply(reason or "❌ UserBot 未加入该源，无法监听")
+            return
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+        target_title = await _format_chat_topic_display(
+            target_chat_id, target_topic_id, prefer_bot=True)
+        task_id, err, created = await _create_monitor_task(
+            source_id=info["chat_id"],
+            target_chat_id=target_chat_id,
+            mode="copy",
+            source_topic_id=info.get("topic_id"),
+            target_topic_id=target_topic_id,
+            source_title=info.get("title"),
+            target_title=target_title,
+            notify_chat_id=event.chat_id,
+            created_by=event.sender_id,
+            userbot=ub or info.get("userbot"))
+        if not task_id:
+            await event.reply(f"❌ {err or '创建监听任务失败'}")
+            return
+        if not created:
+            await event.reply(
+                f"ℹ️ 该监听已存在：任务 #{task_id}，未重复创建。\n"
+                "发 /jtlb 查看监听列表。")
+
+    @bot.on(events.NewMessage(pattern=r"^/kllb(?:@\w+)?$"))
+    async def on_clone_list(event):
+        """克隆任务列表（含已完成的，记录永久保留）。"""
+        if not await _require_admin(event):
+            return
+        await menu.render_tasks(event, edit=False)
+
+    @bot.on(events.NewMessage(pattern=r"^/jtlb(?:@\w+)?$"))
+    async def on_monitor_list(event):
+        """监听任务列表。"""
+        if not await _require_admin(event):
+            return
+        await menu.render_monitors(event, edit=False)
+
+    @bot.on(events.NewMessage(pattern=r"^/kljx(?:@\w+)?(?=\s|$)"))
+    async def on_kl_continue(event):
+        """`/kljx <链接>` 从上次游标继续补到最新，已克隆过的不会重复。"""
+        if not await _require_admin(event):
+            return
+        raw = strip_command(event.raw_text, "kljx")
+        if not raw:
+            await event.reply("用法：`/kljx https://t.me/xxx` — 接着上次进度继续克隆到最新")
+            return
+        info = await _resolve_cmd_source(event, raw)
+        if not info:
+            return
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+        found = await models.find_clone_task(
+            db, info["chat_id"], target_chat_id,
+            info.get("topic_id"), target_topic_id)
+        if not found:
+            await event.reply(
+                "📭 没有找到「该频道 → 本群」的克隆记录。\n"
+                "第一次请用 `/kl <链接>` 新建；已有记录后再用 `/kljx` 补新消息。")
+            return
+
+        cursor = int(found.get("last_synced_msg_id") or 0)
+        follow = int(found.get("follow") or 0)
+
+        # 先看一眼源的最新消息：已经追平就不用空跑一遍
+        latest = await _latest_source_msg_id(
+            info["chat_id"], info.get("topic_id"), info.get("userbot"))
+        if latest is not None and cursor and latest <= cursor:
+            if follow:
+                await _ensure_follow_monitor(found["id"], notify=False)
+            await event.reply(
+                f"✅ 已是最新，没有需要补的消息\n"
+                f"• 上次游标: msg_id={cursor}（源最新 msg_id={latest}）\n"
+                + ("• 持续监听仍在运行，后续新消息会自动转发\n" if follow
+                   else "• 需要跟着转发新消息，可在任务详情里开启 🛰 持续监听\n")
+                + "克隆记录继续保留，不会被清掉。",
+                buttons=[[Button.inline("📋 任务详情", data=f"m:task:{found['id']}")]])
+            return
+
+        await models.reopen_clone_task(db, found["id"], follow=follow, clear_end=True)
+        ok, err = await _resume_clone(found["id"], allow_completed=True)
+        if not ok:
+            await models.update_task_status(db, found["id"], "paused")
+            await event.reply(f"❌ 继续克隆失败：{err or '未知原因'}")
+            return
+
+        tail = ("• 补完后自动持续监听" if follow
+                else "• 需要持续跟新可在任务详情里开启 🛰 持续监听")
+        await event.reply(
+            f"🔁 已从断点继续：任务 #{found['id']}\n"
+            f"• 上次游标: msg_id={cursor}\n"
+            f"• 只补 msg {cursor} 之后的新消息，已克隆过的不会重复\n"
+            f"{tail}",
+            buttons=[[Button.inline("📋 任务详情", data=f"m:task:{found['id']}")]])
+
+    @bot.on(events.NewMessage(pattern=r"^/chapd(?:@\w+)?$"))
+    async def on_chapd(event):
+        """进入「等一条转发消息」状态，用来识别来源频道。"""
+        if not await _require_admin(event):
+            return
+        _chapd_wait[(event.chat_id, event.sender_id)] = time.time()
+        await event.reply(
+            "📡 请把目标频道里的任意一条消息**转发**到本群（用「转发」，不要复制文本）。\n"
+            "我会返回该频道的名称、@用户名、ID 和可直接用于 /kl 的链接。\n"
+            f"（{CHAPD_TTL // 60} 分钟内有效）")
+
+    @bot.on(events.NewMessage(func=lambda e: (
+        getattr(e.message, "fwd_from", None) is not None
+        and (_chapd_wait.get((e.chat_id, e.sender_id)) or 0) > time.time() - CHAPD_TTL
+    )))
+    async def on_chapd_forward(event):
+        if not await _require_admin(event):
+            return
+        _chapd_wait.pop((event.chat_id, event.sender_id), None)
+        info = describe_forwarded_source(event.message)
+        if not info:
+            await event.reply("⚠️ 这条消息里没有可识别的频道来源，请确认是从频道转发（不是复制文本）后重试。")
+            return
+        username_line = f"@{info['username']}" if info["username"] else "无（私有频道）"
+        await event.reply(
+            "📡 已识别来源频道\n"
+            f"• 名称: {info['title']}\n"
+            f"• 用户名: {username_line}\n"
+            f"• ID: {info['chat_id']}\n"
+            f"• 链接: {info['link']}\n\n"
+            "可直接复制下面的命令：\n"
+            f"`/kl {info['link']}` — 克隆全部并持续监听\n"
+            f"`/kljx {info['link']}` — 只补新消息\n"
+            f"`/jt {info['link']}` — 只监听新消息\n"
+            f"`/kl {info['chat_id']}` — 用频道 ID 直接克隆")
 
     @bot.on(events.NewMessage(pattern=r"/sync(?:@\w+)?\s+"))
     async def on_sync(event):
@@ -1328,13 +1807,14 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not await _require_admin(event):
             return
 
-        tasks = await models.get_all_active_tasks(db)
+        tasks = await models.get_tasks_for_list(
+            db, models.CLONE_TASK_TYPES + ("monitor",), limit=20)
         if not tasks:
-            await event.reply("📭 没有活跃的任务")
+            await event.reply("📭 还没有任务")
             return
 
         buttons = await _build_task_buttons(tasks)
-        await event.reply("📋 任务列表（点击管理）:", buttons=buttons)
+        await event.reply("📋 任务列表（含已完成；点击管理）:", buttons=buttons)
 
     async def _show_task_detail(event, task_id: int):
         """渲染任务详情内联键盘（共享逻辑）。"""
@@ -1374,6 +1854,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 f" · 跳过 {int(t.get('skip_count') or 0):,}")
             if t.get("last_error"):
                 text += f"\n最近错误: {str(t['last_error'])[:80]}"
+            follow_on = bool(int(t.get("follow") or 0))
+            monitor_id = int(t.get("follow_task_id") or 0)
+            text += ("\n持续监听: 🛰 开启"
+                     + (f"（监听任务 #{monitor_id}）" if monitor_id else "")
+                     if follow_on else "\n持续监听: ⏹ 关闭")
         else:
             # 监控任务：显示已转发条数、最近消息与最近活动
             try:
@@ -1404,6 +1889,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if source_link:
             buttons.append([Button.url("🔗 打开源", source_link)])
 
+        if t["type"] in models.CLONE_TASK_TYPES:
+            follow_on = bool(int(t.get("follow") or 0))
+            buttons.append([Button.inline(
+                "⏹ 关闭持续监听" if follow_on else "🛰 开启持续监听",
+                data=f"follow:{task_id}")])
+
         action_row = []
         if t["status"] == "running":
             action_row.append(Button.inline("⏸ 暂停", data=f"pause:{task_id}"))
@@ -1420,6 +1911,15 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not await _require_admin(event, alert=True):
             return
         task_id = int(event.pattern_match.group(1))
+        await _show_task_detail(event, task_id)
+
+    @bot.on(events.CallbackQuery(pattern=rb"follow:(\d+)"))
+    async def on_follow_toggle(event):
+        if not await _require_admin(event, alert=True):
+            return
+        task_id = int(event.pattern_match.group(1))
+        ok, msg = await _toggle_follow(task_id)
+        await event.answer(msg, alert=not ok)
         await _show_task_detail(event, task_id)
 
     @bot.on(events.CallbackQuery(pattern=rb"pause:(\d+)"))
@@ -1470,7 +1970,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if t["status"] == "running":
             await _stop_running_task(t)
 
-        await models.update_task_status(db, task_id, "completed")
+        await models.update_task_status(db, task_id, "deleted")
         logger.info("任务 #%s 已删除", task_id)
         await event.answer(f"🗑 任务 #{task_id} 已删除")
         await _refresh_list(event)
@@ -1480,11 +1980,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not await _require_admin(event, alert=True):
             return
 
-        tasks = await models.get_all_active_tasks(db)
+        tasks = await models.get_tasks_for_list(
+            db, models.CLONE_TASK_TYPES + ("monitor",), limit=500)
         for t in tasks:
             if t["status"] == "running":
                 await _stop_running_task(t)
-            await models.update_task_status(db, t["id"], "completed")
+            await models.update_task_status(db, t["id"], "deleted")
 
         logger.info("已清空所有任务，共 %d 个", len(tasks))
         await event.answer(f"🗑 已清空 {len(tasks)} 个任务")

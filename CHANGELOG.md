@@ -7,6 +7,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **克隆记录永久保留**：`completed` 的克隆任务不再从列表消失。
+  - 列表查询改为 `status != 'deleted'`，并按 `running → paused → failed → 其它` 排序，
+    已完成的克隆始终可见（`db/models.py: get_tasks_for_list`）
+  - 删除与「清空」改为**软删除**（`status='deleted'`），游标、`message_map` 映射、
+    完成时间都留在库里，误删可手工把状态改回 `paused` 复活
+  - `/kllb`、主菜单「📋 克隆任务列表」都基于这份查询
+- **跑完自动转持续监听**：克隆任务完成时 `syncer.on_complete` → `_on_clone_completed`
+  → `_ensure_follow_monitor`，自动建一个 `monitor` 任务接管后续新消息，
+  并用 `parent_id` 指回来源克隆任务；监控列表显示「（来自克隆任务 #N）」。
+  `clone.follow_after_finish: false` 可全局关闭。
+- **持续监听开关**：任务详情新增 `🛰 持续监听: 开启（监听任务 #N）/ ⏹ 关闭` 与
+  `follow:<id>` 按钮（`_toggle_follow`）。关闭只是暂停对应 monitor 任务并清 `follow` 标记，
+  记录与已转发计数都保留，再点一次即恢复。
+- **消息 ID 区间克隆**：`/kl 100-1100 <链接>`，`tasks.end_msg_id` 落库，
+  `iter_messages` 用 `max_id = end_msg_id + 1` 保证**两端都含**；进度描述写作「→ 到消息 N 为止」。
+- **新命令族**（`bot/handlers.py`，`/help` 同步改写为命令↔功能对照）：
+  | 命令 | 作用 |
+  | --- | --- |
+  | `/kl <链接>` | 克隆全部到本群，完成后持续监听 |
+  | `/kl 100-1100 <链接>` | 只克隆该 ID 区间（含两端） |
+  | `/kljx <链接>` | 继续克隆：`find_clone_task` 找同源同目标最新记录 → `reopen_clone_task` → 从游标续跑，不重复；先比对源最新消息（`latest_source_msg_id`），已追平就回「已是最新」不空跑，查不到才按无法判断处理（不会误判成已追平） |
+  | `/jt <链接>` | 只监听新消息，先校验 UserBot 已加入源 |
+  | `/kllb` | 克隆任务列表 |
+  | `/jtlb` | 监听任务列表 |
+  | `/chapd` | 等一条转发的频道消息，返回频道名 / @用户名 / ID / 链接与现成命令（10 分钟 TTL，`describe_forwarded_source`） |
+- `bot/menu.py`：主菜单改为「👁 新建持续监听 / 📥 新建克隆任务 / 📋 克隆任务列表 /
+  📡 监听任务列表 / ⚙️ 限流设置 / ❓ 命令与说明」；列表标题显示「运行中 N · 持续监听 M」，
+  持续监听的任务行带 `🛰` 标记；已完成克隆在详情页提供「🔁 继续补新消息」（`cont:<id>`）。
+- `config.example.yaml`：新增 `clone.follow_after_finish: true`。
+- `test/test_clone_follow.py`（26 个用例）：命令参数解析、转发来源识别、新列与老库迁移、
+  已完成记录可查与 `reopen_clone_task`、区间克隆的 `max_id` 边界、详情页按钮与 `follow:`/`cont:` 分发、
+  `/chapd` 提示与识别结果、`latest_source_msg_id` 的多客户端回退与"查不到返回 None"。
+
+### Fixed
+- **「实时监控新消息」建了却不生效、且没有任何提示**：
+  - 根因：`events.NewMessage(chats=<源>)` 在 UserBot 无法解析该实体（私有频道、未缓存）时
+    **静默收不到任何更新**。改为注册 `events.NewMessage()` 全量接收，再用 `_match_chat`
+    手工比较 `event.chat_id`（拿不到 `chat_id` 时退回 `message.peer_id`，仍无法判定则**放行**，
+    宁可多判一次也不静默漏转）。
+  - 创建失败不再只弹一个转瞬即逝的 toast：`event.answer(alert=True)` + 原地改写消息，
+    写明失败原因、常见原因和「重试」按钮。
+  - 向导中非管理员的操作从静默丢弃改为明确回复「⛔ 无权限」。
+
+### Changed
+- `/list` 与菜单列表统一走 `get_tasks_for_list`，克隆与监控混排时仍能一眼看出类型与状态。
+- `_resume_clone(task_id, allow_completed=False)`：允许从 `completed` 状态续跑，供 `/kljx` 与
+  「🔁 继续补新消息」使用。
+
+### Added（更早一批：自动更新与数据持久化）
 - **NAS 自动更新链路**（`docker-compose.yaml` 内置 `watchtower`）：CI 推送 `:latest` 后，
   群晖上的 watchtower 每 10 分钟检查一次 digest，有新镜像就优雅停止并原地重建 bot，
   不再需要 SSH 进去手动 `docker compose pull`。使用维护中的 fork
@@ -57,7 +106,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `core/clone_plan.py`：时间解析、进度条渲染、耗时估算、**相册安全分批**等纯逻辑工具。
 - `docs/clone.md`：克隆功能说明（起点语义、进度字段、续传机制、FAQ）。
 
-### Changed
+### Changed（更早一批）
 - `docker-compose.yaml`：补充挂载注释（`/app/data` 即数据库所在）、可选的独立 db 目录挂载示例、
   `stop_grace_period: 20s`，并说明不要直接挂载单个 `bot.db` 文件。
 - `main.py` 启动流程改为先解析路径再建目录/连库，退出路径统一关闭数据库。

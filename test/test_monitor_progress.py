@@ -188,7 +188,7 @@ class MonitorMenuTest(unittest.IsolatedAsyncioTestCase):
         await self.menu.render_monitors(ev, edit=False)
 
         text = ev.sent[-1][0]
-        self.assertIn("实时监控任务", text)
+        self.assertIn("监听任务", text)
         self.assertIn("源频道A", text)
         self.assertIn("目标群B", text)
         self.assertIn("已转发 15", text)
