@@ -241,6 +241,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     restricted_syncer = RestrictedSyncer(bot, userbot, db, config, userbot_manager=userbot_manager)
     forwarder = monitor_manager.forwarder
     _sync_tasks: dict[int, asyncio.Task] = {}
+    # 克隆并发闸门：默认同时只跑 1 个克隆任务。
+    # 每个 Syncer 自带一个 RateLimiter，同时跑 N 个时实际频率就是设计值 × N，
+    # FloodWait 会成倍到来——排队比并行更安全。
+    max_concurrent = max(1, int((config.get("clone") or {}).get("max_concurrent", 1)))
+    _clone_gate = asyncio.Semaphore(max_concurrent)
 
     def is_admin(user_id: int) -> bool:
         return user_id in admin_ids
@@ -548,26 +553,46 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                     source_topic_id: int | None, target_topic_id: int | None,
                     notify_chat_id: int | None, notify_msg_id: int | None,
                     userbot: TelegramClient | None) -> None:
-        task = asyncio.create_task(syncer.start_sync(
-            task_id, source_id, target_chat_id, mode,
-            source_topic_id=source_topic_id,
-            target_topic_id=target_topic_id,
-            notify_chat_id=notify_chat_id,
-            notify_topic_id=target_topic_id,
-            notify_reply_to_msg_id=notify_msg_id,
-            userbot=userbot))
+        async def _runner() -> None:
+            # 排队提示只在前方确实有任务时发一次，避免续传时刷屏
+            if _clone_gate.locked():
+                logger.info("克隆并发已达上限 %d，任务 #%d 排队等待",
+                            max_concurrent, task_id)
+                try:
+                    await bot.send_message(
+                        notify_chat_id or target_chat_id,
+                        f"⏳ 任务 #{task_id} 已排队：当前已有 {max_concurrent} 个克隆在跑，"
+                        f"前面的跑完会自动开始（不建议同时跑多个，限流会成倍到来）",
+                        reply_to=target_topic_id or None)
+                except Exception as e:
+                    logger.debug("发送排队提示失败: %s", e)
+            async with _clone_gate:
+                await syncer.start_sync(
+                    task_id, source_id, target_chat_id, mode,
+                    source_topic_id=source_topic_id,
+                    target_topic_id=target_topic_id,
+                    notify_chat_id=notify_chat_id,
+                    notify_topic_id=target_topic_id,
+                    notify_reply_to_msg_id=notify_msg_id,
+                    userbot=userbot)
+
+        task = asyncio.create_task(_runner())
         _track(task_id, task)
 
     async def _spawn_restricted(task_id: int, t: dict,
                                 userbot: TelegramClient | None = None) -> None:
-        task = asyncio.create_task(restricted_syncer.start_sync(
-            task_id, t["source_chat_id"], t["target_chat_id"],
-            source_topic_id=t["source_topic_id"],
-            target_topic_id=t["target_topic_id"],
-            notify_chat_id=t.get("notify_chat_id") or t["target_chat_id"],
-            notify_topic_id=t["target_topic_id"],
-            notify_reply_to_msg_id=t.get("notify_msg_id"),
-            userbot=userbot))
+        async def _runner() -> None:
+            async with _clone_gate:
+                await restricted_syncer.start_sync(
+                    task_id, t["source_chat_id"], t["target_chat_id"],
+                    source_topic_id=t["source_topic_id"],
+                    target_topic_id=t["target_topic_id"],
+                    notify_chat_id=t.get("notify_chat_id") or t["target_chat_id"],
+                    notify_topic_id=t["target_topic_id"],
+                    notify_reply_to_msg_id=t.get("notify_msg_id"),
+                    userbot=userbot)
+
+        task = asyncio.create_task(_runner())
         _track(task_id, task)
 
     async def _create_clone_task(*, source_id: int, target_chat_id: int, mode: str,
@@ -1319,7 +1344,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "/kljx <链接> 120-1000 — 只克隆 msg 120~1000\n"
             "/jt <链接> — 只监听新消息（不克隆历史）\n"
             "/kllb — 克隆任务列表（含已完成，记录永久保留）\n"
-            "/jtlb — 监听任务列表\n\n"
+            "/jtlb — 监听任务列表\n"
+            "/klfail — 查看哪些任务有失败（带 ID 看明细）\n"
+            "/retryfail <任务id|all> — 一键补发失败条目，补齐缺口\n\n"
             "【工具】\n"
             "/chapd — 转发一条频道消息到本群，识别来源频道名称/ID/链接\n"
             "/chaid — 转发一条频道消息到本群，返回消息 ID 和消息链接（配 /kljx 用）\n"
@@ -1575,6 +1602,93 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             f"• 只补 msg {cursor} 之后的新消息，已克隆过的不会重复\n"
             f"{tail}",
             buttons=[[Button.inline("📋 任务详情", data=f"m:task:{found['id']}")]])
+
+    @bot.on(events.NewMessage(pattern=r"^/klfail(?:@\w+)?(?=\s|$)"))
+    async def on_clone_failures(event):
+        """失败清单：`/klfail` 看哪些任务有失败，`/klfail <id>` 看明细。"""
+        if not await _require_admin(event):
+            return
+        raw = strip_command(event.raw_text, "klfail").strip()
+
+        if raw.isdigit():
+            task_id = int(raw)
+            if not await models.get_task(db, task_id):
+                await event.reply(f"❌ 任务 #{task_id} 不存在")
+                return
+            rows = await models.list_failed_messages(db, task_id, limit=30)
+            total = await models.count_failed_messages(db, task_id)
+            if not rows:
+                await event.reply(f"✅ 任务 #{task_id} 没有失败记录")
+                return
+            lines = [f"⚠️ 任务 #{task_id} 失败明细（共 {total} 条，显示前 {len(rows)} 条）"]
+            for r in rows:
+                reason = (r.get("reason") or "未记录原因").replace("\n", " ")
+                lines.append(
+                    f"• msg {r['source_msg_id']} · 第 {r.get('attempts') or 1} 次"
+                    f" · {truncate(reason, 40)}")
+            lines.append(f"\n补发：`/retryfail {task_id}`")
+            await event.reply("\n".join(lines))
+            return
+
+        tasks = await models.get_tasks_with_failures(db, limit=10)
+        if not tasks:
+            await event.reply("✅ 没有失败记录，全部克隆都完整落地了")
+            return
+        lines = ["⚠️ 有失败记录的任务"]
+        for t in tasks:
+            src = t.get("source_title") or str(t["source_chat_id"])
+            tgt = t.get("target_title") or str(t["target_chat_id"])
+            lines.append(f"• #{t['id']} {truncate(src, 18)} → {truncate(tgt, 14)}"
+                         f" · 失败 {t['failed_n']} 条")
+        lines.append("\n查看明细：`/klfail <任务id>`　一键补发：`/retryfail <任务id>`")
+        await event.reply("\n".join(lines))
+
+    @bot.on(events.NewMessage(pattern=r"^/retryfail(?:@\w+)?(?=\s|$)"))
+    async def on_retry_failed(event):
+        """按失败清单补发：`/retryfail <任务id>` 或 `/retryfail all`。"""
+        if not await _require_admin(event):
+            return
+        raw = strip_command(event.raw_text, "retryfail").strip()
+        if raw not in ("all", "全部") and not raw.isdigit():
+            await event.reply(
+                "用法：\n"
+                "• `/retryfail 12` — 补发任务 #12 的失败条目\n"
+                "• `/retryfail all` — 补发所有任务的失败条目\n"
+                "（先 `/klfail` 看有哪些任务存在缺口）")
+            return
+
+        if raw.isdigit():
+            targets = [int(raw)]
+        else:
+            targets = [t["id"] for t in await models.get_tasks_with_failures(db, limit=20)]
+        if not targets:
+            await event.reply("✅ 没有需要补发的失败记录")
+            return
+
+        await event.reply(
+            f"🔁 开始补发 {len(targets)} 个任务的失败条目…"
+            + ("\n⏳ 已有克隆在跑，等它跑完自动开始" if _clone_gate.locked() else ""))
+
+        total_ok = total_fail = 0
+        details: list[str] = []
+        async with _clone_gate:
+            for tid in targets:
+                try:
+                    ok, still = await syncer.retry_failed(tid)
+                except Exception as e:
+                    logger.warning("补发任务 #%s 失败: %s", tid, e)
+                    details.append(f"• #{tid} 补发出错：{type(e).__name__}")
+                    continue
+                total_ok += ok
+                total_fail += still
+                if ok or still:
+                    details.append(f"• #{tid} 补成功 {ok} 条 · 仍失败 {still} 条")
+
+        text = [f"🔁 补发结束：成功 {total_ok} 条，仍失败 {total_fail} 条"]
+        text.extend(details[:15])
+        if total_fail:
+            text.append("仍失败的条目通常是源消息已删除、超出体积上限或仍被限制。")
+        await event.reply("\n".join(text))
 
     @bot.on(events.NewMessage(pattern=r"^/chapd(?:@\w+)?$"))
     async def on_chapd(event):

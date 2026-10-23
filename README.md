@@ -11,7 +11,13 @@
 - **频道克隆** — 把任意频道/群组（含话题）从最早一条克隆到最新一条
 - **起点可选** — 从头 / 从指定消息 ID / **指定消息 ID 区间** / 从指定时间 / 继续上次进度
 - **进度可见** — 进度条、百分比、速率、剩余时间，原地刷新不刷屏
+- **完整性校验** — 克隆结束直接给出「源 N 条 / 已映射 M 条 / 覆盖率 X% / 缺口 K 条」，存档型用途一眼知道抓全没有
+- **失败可补** — `/klfail` 看失败条目与原因，`/retryfail <id|all>` 一键补发，不必手工翻记录
 - **断点续传** — 暂停、崩溃、重启后都从游标继续，不重复不遗漏
+- **幂等去重** — `message_map` 唯一约束 + 发送前查重，重跑/续补/超时重试都不会在目标里产生重复消息
+- **卡死自愈** — 单条策略超时（默认 1200s）自动止损降级；独立看门狗 10 分钟无进展主动告警
+- **引用刷新** — 媒体 `file_reference` 过期时重取消息再试（最多 2 次），长任务后半段不再成批丢媒体
+- **并发闸门** — 默认同时只跑 1 个克隆任务，其余排队（`clone.max_concurrent`），避免限流成倍叠加
 - **记录永久保留** — 克隆跑完（`completed`）仍留在克隆任务列表里，随时可 `/kljx` 补新消息或重新开启持续监听；删除为软删除，不物理销毁记录
 - **跑完自动持续监听** — 克隆结束自动接手后续新消息（`clone.follow_after_finish`），并在监听任务列表里长期显示；每个克隆任务详情里可一键 🛰 开启 / ⏹ 关闭
 - **链接解析** — 私聊发送 `t.me/...` 链接即可触发，支持公开/私有频道、群组、评论区、话题
@@ -26,7 +32,7 @@
 - **数据持久化** — 任务与断点存在 SQLite（`data/bot.db`），目录挂载即随镜像升级保留；菜单「💾 备份数据库」一键在线快照，启动自检会提示未持久化的路径（见 [docs/storage.md](docs/storage.md)）
 - **代理自愈** — 网络无法直连 Telegram 时，自动从公共 MTProto 代理榜单选优（见 [docs/proxy-auto.md](docs/proxy-auto.md)）
 
-克隆功能的完整说明见 [docs/clone.md](docs/clone.md)；监控任务的进度口径与防重复规则见 [docs/monitor.md](docs/monitor.md)；数据落盘、备份与迁移见 [docs/storage.md](docs/storage.md)。
+克隆功能的完整说明见 [docs/clone.md](docs/clone.md)；监控任务的进度口径与防重复规则见 [docs/monitor.md](docs/monitor.md)；数据落盘、备份与迁移见 [docs/storage.md](docs/storage.md)；与主流 Bot 框架的架构对比及可借鉴设计见 [docs/library-comparison.md](docs/library-comparison.md)；与三个同类开源项目的架构对比见 [docs/project-comparison.md](docs/project-comparison.md)；七个来源汇总的可选优化清单（决策版）见 [docs/optimization-menu.md](docs/optimization-menu.md)。
 
 ## 架构
 
@@ -97,6 +103,8 @@ python main.py
 | `/jt <链接>`              | 只监听新消息并克隆到本群，不补历史                                       |
 | `/kllb`                   | 克隆任务列表（含已完成，记录永久保留）                                   |
 | `/jtlb`                   | 监听任务列表（含来自克隆任务的持续监听）                                 |
+| `/klfail`                 | 查看有失败记录的任务；`/klfail 12` 看任务 #12 的失败明细与原因           |
+| `/retryfail <id\|all>`    | 按失败清单补发（不改动续跑游标），如 `/retryfail 12`、`/retryfail all`   |
 | `/chapd`                  | 提示你转发一条频道消息到本群，识别来源频道名 / @用户名 / ID / 链接       |
 | `/chaid`                  | 提示你转发一条频道消息到本群，返回**消息 ID** 和**消息链接**（配 `/kljx`）|
 | `/help`                   | 显示全部命令与功能对照                                                   |
@@ -157,6 +165,33 @@ python main.py
 > **提示**：日志里的「策略1成功」只表示第一层命中，`copy` 模式下可能实际用的是
 > `send_message` / `send_file`。评论链接 `?comment=` 的消息位于 discussion 群，
 > 主贴公开不代表评论区也公开。
+
+### 稳定性兜底（长任务必备）
+
+克隆一个大频道往往要跑几小时，真正会让任务停摆的不是「慢」，而是下面几种静默失败。
+这几项都可在 `config.yaml` 调整：
+
+| 机制 | 配置项 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| 单条策略超时 | `transfer.strategy_timeout` | 1200s | 半开连接/TCP 假死时 Telethon 请求会永久挂住；超时后放弃该层继续降级 |
+| 引用刷新重试 | `transfer.file_ref_retries` | 2 | `FILE_REFERENCE_EXPIRED` 时重取消息拿新引用再试，长任务后半段不再成批丢媒体 |
+| 卡死告警 | `clone.stall_alert_seconds` | 600s | 独立看门狗：主循环完全停住时仍能向你发通知（循环内的自检此时已不会执行） |
+| 并发闸门 | `clone.max_concurrent` | 1 | 每个任务自带限流器，同时跑 N 个实际频率就是设计值 × N，排队比并行安全 |
+| 幂等去重 | —（自动） | 开 | `message_map` 唯一索引 + 发送前查重，重跑不产生重复消息 |
+| 下载预取 | `transfer.prefetch_ahead` | 1 | 策略3 连续命中时，下载下一条与本次上传重叠，媒体频道约省一半时间 |
+
+完成后消息会多出两行可观测信息：
+
+```
+📊 完整性: 源 1,286 条 · 已映射 1,279 条 · 覆盖率 99.5% · 缺口 7 条（/klfail 查看，/retryfail 补）
+• 策略分布: Bot直接 12 · UserBot转发 1,240 · 下载+上传 27
+• 自愈: 超时止损 2 次 · 引用刷新 1 次
+```
+
+> **关于「要不要让 UserBot 优先」**：`transfer.prefer_userbot_on_own_target` 默认 `false`。
+> 策略1（Bot 直接转发）本来就是服务端搬运、不占本机带宽，单条约 0.3s；而 UserBot 受
+> 3–6s 独立节奏限制，提前反而慢一个数量级。只有当「Bot 能在源里读、却在目标里发不出」
+> 这种组合出现时，打开它才有意义。
 
 ## Docker 部署
 

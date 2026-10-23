@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added（长任务稳定性：卡死自愈 / 完整性校验 / 失败补发）
+- **单条策略超时**（`transfer.strategy_timeout`，默认 1200s，0=不限）：策略调用统一走
+  `_call_with_timeout`，半开连接或 TCP 假死时不再让整个任务停在同一游标上，超时即降级。
+- **媒体引用刷新重试**（`transfer.file_ref_retries`，默认 2）：`_with_fresh_ref` /
+  `_with_fresh_ref_list` 捕获 `FileReferenceExpiredError` / `FileReferenceInvalidError`
+  后重取消息拿新 `file_reference` 再试。此前该异常被 `except Exception` 吞掉，
+  表现为「这条消息凭空消失」（打上 `#fail2forward`）。
+- **独立卡死看门狗**（`clone.stall_alert_seconds`，默认 600s）：`_stall_watchdog` 协程
+  每 1/4 周期检查心跳，主循环完全停住时仍能发出告警（循环内自检此时已不会执行），
+  最多告警 3 次。
+- **完整性校验**：克隆完成消息新增
+  `📊 完整性: 源 N 条 · 已映射 M 条 · 覆盖率 X% · 缺口 K 条`，
+  以及 `• 自愈: 超时止损 a 次 · 引用刷新 b 次`。
+- **失败清单与补发**：新表 `failed_messages(task_id, source_msg_id, reason, attempts)`；
+  新增命令 `/klfail`（概览 / 明细）与 `/retryfail <id|all>`（`Syncer.retry_failed`，
+  不推进续跑游标）。
+- **并发闸门**（`clone.max_concurrent`，默认 1）：`_spawn_sync` / `_spawn_restricted`
+  走同一 `asyncio.Semaphore`，超出时排队并提示；避免多任务频率叠加导致 FloodWait 成倍到来。
+- **下载预取**（`transfer.prefetch_ahead`，默认 1）：策略③ 连续命中 3 次后自动开启，
+  处理第 N 条时后台下载第 N+1 条，与本次上传重叠；命中缓存时跳过下载。
+- **可选策略重排**（`transfer.prefer_userbot_on_own_target`，默认 **false**）：
+  目标为自己频道时可让 UserBot 服务端转发先行。默认关闭——策略① 本身就是服务端搬运
+  （单条约 0.3s），UserBot 受 3–6s 节奏限制，提前反而更慢；仅当「Bot 能读源、却发不出目标」时值得开启。
+
+### Changed（幂等去重）
+- `message_map` 增加 `UNIQUE(task_id, source_msg_id)`：启动时 `_ensure_message_map_unique`
+  先按 (task_id, source_msg_id) 保留最早一条、删除其余重复再建索引（幂等，旧库可平滑升级）。
+- `save_message_map` 改为 `INSERT OR IGNORE`；`_forward_unit` 发送前用 `get_mapped_ids`
+  批量查重，已映射的计入 `skip_count` 而不重复投递。相册部分已映射时拆成单条补发，
+  避免整组重发造成重复。
+
 ### Changed（转发策略：私有频道不再下载）
 - **统一降级链**（`core/forwarder.py`）：公共频道与私有频道走同一顺序，逐级降级
   `① Bot 直接克隆 → ② UserBot 转发 → ②b UserBot 读+Bot 写 → ③ 下载+上传 → ④ 失败标记`。

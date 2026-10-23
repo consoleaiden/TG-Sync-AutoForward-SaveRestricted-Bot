@@ -269,10 +269,12 @@ UserBot 走的是**用户账号**，被限流/限制的代价远高于 Bot（Bot
 
 ```yaml
 clone:
-  auto_resume: true          # 重启后自动从断点继续
-  batch_size: 200            # 每批拉取条数
-  progress_notify_every: 50  # 每 N 条刷新一次进度
-  follow_after_finish: true  # 克隆跑完自动转持续监听
+  auto_resume: true            # 重启后自动从断点继续
+  batch_size: 200              # 每批拉取条数
+  progress_notify_every: 50    # 每 N 条刷新一次进度
+  max_concurrent: 1            # 同时最多跑几个克隆（其余排队）
+  stall_alert_seconds: 600     # 多少秒无进展就告警（0=关闭）
+  follow_after_finish: true    # 克隆跑完自动转持续监听
 
 transfer:
   userbot_forward: true         # 允许 UserBot 直接转发（策略②）
@@ -280,6 +282,10 @@ transfer:
   userbot_max_flood: 3          # 连续 N 次 UserBot FloodWait 后本次运行停用策略②
   userbot_flood_buffer: 5       # FloodWait 额外多等的秒数
   probe_ttl_seconds: 1800       # 「Bot 读不到源 / UserBot 不能发目标」判定缓存时长
+  prefer_userbot_on_own_target: false  # 目标为自己频道时 UserBot 先行（默认关，见下）
+  strategy_timeout: 1200        # 单条策略最长耗时，超时降级（0=不限）
+  file_ref_retries: 2           # 媒体引用过期后的重取重试次数
+  prefetch_ahead: 1             # 下载预取深度（0=关闭）
 
 rate_limit:
   userbot_forward_interval: [3, 6]     # UserBot 每条的间隔（替换通用间隔）
@@ -291,9 +297,52 @@ rate_limit:
 比对后 `ALTER TABLE ADD COLUMN`，只增不改，老数据保留），本轮新增
 `end_msg_id`、`follow`、`follow_task_id`、`parent_id`。
 
+数据库层面还有一次自动迁移：给 `message_map` 建 `UNIQUE(task_id, source_msg_id)`。
+若旧库里已有重复映射（重跑造成），会先按该组合保留最早一条、删掉其余，再建索引；
+整个过程幂等，日志里会出现 `已为 message_map 建立唯一索引（重复映射已清理）`。
+
 ---
 
-## 11. 常见问题
+## 11. 长任务会怎么失败，以及怎么兜住
+
+克隆一个几千条的频道通常要跑几小时。实践中最常见的失败不是「慢」，而是下面三类
+**静默失败**——表面上任务还在 running，实际上已经不再前进：
+
+| 现象 | 根因 | 本项目的兜法 |
+| --- | --- | --- |
+| 进度条长时间停在同一游标 | 半开连接 / TCP 假死，Telethon 请求永久挂起 | `transfer.strategy_timeout`（默认 1200s）超时即放弃该策略继续降级；独立看门狗 `clone.stall_alert_seconds`（默认 600s）主动发消息告警 |
+| 后半段媒体成批失败 | `file_reference` 过期（引用有时效，长任务必然遇到） | `_with_fresh_ref` 重取消息拿新引用再试，`transfer.file_ref_retries`（默认 2）次 |
+| 目标频道出现重复消息 | 重跑 / 续补 / 超时重试把同一条又喂了一遍 | `message_map` 唯一索引 + 发送前 `get_mapped_ids` 批量查重，已映射计入 `skip_count` |
+
+### 完整性校验
+
+克隆结束的消息末尾会多出两行：
+
+```
+📊 完整性: 源 1,286 条 · 已映射 1,279 条 · 覆盖率 99.5% · 缺口 7 条（/klfail 查看，/retryfail 补）
+• 自愈: 超时止损 2 次 · 引用刷新 1 次
+```
+
+- 分母是「源范围内应处理条数 − 跳过条数」（跳过的是服务消息/空消息，本就不该落地）；
+- 缺口 > 0 时先 `/klfail <任务id>` 看原因，再 `/retryfail <任务id>` 补；
+- 补发**不会改动续跑游标**，补完仍可正常 `/kljx` 跟新。
+
+### 并发闸门为什么默认 1
+
+每个 `Syncer` 自带一个 `RateLimiter`，两个任务并行时实际请求频率是配置值的 2 倍，
+FloodWait 会成倍到来；而克隆本身是「服务端搬运」，并行并不提速（瓶颈在 Telegram 侧）。
+所以默认排队，需要时再调 `clone.max_concurrent`。
+
+### 关于 `prefer_userbot_on_own_target`
+
+默认关闭。策略①（Bot 直接转发）本身就是服务端搬运、不占本机带宽，单条约 0.3s；
+UserBot 有独立的 3–6s 节奏，把 UserBot 提前反而慢一个数量级。
+只有当出现「Bot 能在源里读、却在目标里发不出（被限制/无发言权）」这种组合时，
+打开它才能省掉每条一次的失败探测。
+
+---
+
+## 12. 常见问题
 
 **Q：点了「继续」但没有任何反应？**
 看日志有没有 `克隆任务 #N 已从游标 X 继续`。若源已不可读（UserBot 被踢、

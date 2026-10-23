@@ -113,10 +113,44 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_message_map_task
                 ON message_map(task_id, source_msg_id);
+            CREATE TABLE IF NOT EXISTS failed_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id),
+                source_msg_id INTEGER NOT NULL,
+                reason TEXT DEFAULT '',
+                attempts INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(task_id, source_msg_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, type);
         """)
         await self._migrate()
+        await self._ensure_message_map_unique()
         await self.db.commit()
+
+    async def _ensure_message_map_unique(self):
+        """给 message_map 补 UNIQUE(task_id, source_msg_id)。
+
+        旧库可能已有重复行（重跑/续补造成），直接建唯一索引会失败，
+        因此先按 (task_id, source_msg_id) 保留最早一条、删掉其余重复，
+        再建索引。整个过程幂等，可反复执行。
+        """
+        cursor = await self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name='idx_message_map_uniq'")
+        if await cursor.fetchone():
+            return
+        try:
+            await self.db.execute(
+                "DELETE FROM message_map WHERE id NOT IN ("
+                " SELECT MIN(id) FROM message_map GROUP BY task_id, source_msg_id)")
+            await self.db.execute(
+                "CREATE UNIQUE INDEX idx_message_map_uniq"
+                " ON message_map(task_id, source_msg_id)")
+            logger.info("已为 message_map 建立唯一索引（重复映射已清理）")
+        except Exception as e:
+            # 唯一索引建不起来不影响主流程：写入侧已用 INSERT OR IGNORE + 预查重兜底
+            logger.warning("建立 message_map 唯一索引失败（忽略）: %s", e)
 
     async def _migrate(self):
         """为旧库补齐新增列（幂等）。"""

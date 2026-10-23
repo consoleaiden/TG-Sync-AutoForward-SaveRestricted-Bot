@@ -292,10 +292,86 @@ async def get_tasks_by_type(db: Database, task_type: str) -> list[dict]:
 
 async def save_message_map(db: Database, task_id: int,
                            source_msg_id: int, target_msg_id: int):
+    """记录「源消息 → 目标消息」映射。
+
+    用 INSERT OR IGNORE 保证幂等：同一 (task_id, source_msg_id) 只保留第一次，
+    重复发送时不会插入第二行（配合发送前查重，可从根上避免重复投递）。
+    """
     await db.db.execute(
-        "INSERT INTO message_map (task_id, source_msg_id, target_msg_id) VALUES (?,?,?)",
+        "INSERT OR IGNORE INTO message_map"
+        " (task_id, source_msg_id, target_msg_id) VALUES (?,?,?)",
         (task_id, source_msg_id, target_msg_id))
     await db.db.commit()
+
+
+async def get_mapped_ids(db: Database, task_id: int,
+                         source_msg_ids: list[int]) -> set[int]:
+    """批量查这些源消息里哪些已经转发过（用于发送前跳过，避免重复）。"""
+    if not source_msg_ids:
+        return set()
+    placeholders = ",".join("?" * len(source_msg_ids))
+    cursor = await db.db.execute(
+        f"SELECT source_msg_id FROM message_map"
+        f" WHERE task_id=? AND source_msg_id IN ({placeholders})",
+        (task_id, *source_msg_ids))
+    return {int(r["source_msg_id"]) for r in await cursor.fetchall()}
+
+
+async def count_message_map(db: Database, task_id: int) -> int:
+    """该任务已成功映射的源消息条数（用于覆盖率统计）。"""
+    cursor = await db.db.execute(
+        "SELECT COUNT(*) AS n FROM message_map WHERE task_id=?", (task_id,))
+    row = await cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
+async def add_failed_message(db: Database, task_id: int, source_msg_id: int,
+                             reason: str = "") -> None:
+    """登记一条转发失败的消息（供 /klfail 查看、/retryfail 重试）。"""
+    await db.db.execute(
+        """INSERT INTO failed_messages (task_id, source_msg_id, reason)
+           VALUES (?,?,?)
+           ON CONFLICT(task_id, source_msg_id)
+           DO UPDATE SET attempts=attempts+1, reason=excluded.reason,
+                         created_at=CURRENT_TIMESTAMP""",
+        (task_id, int(source_msg_id), (reason or "")[:300]))
+    await db.db.commit()
+
+
+async def clear_failed_message(db: Database, task_id: int,
+                               source_msg_id: int) -> None:
+    await db.db.execute(
+        "DELETE FROM failed_messages WHERE task_id=? AND source_msg_id=?",
+        (task_id, int(source_msg_id)))
+    await db.db.commit()
+
+
+async def list_failed_messages(db: Database, task_id: int,
+                               limit: int = 50) -> list[dict]:
+    cursor = await db.db.execute(
+        """SELECT * FROM failed_messages WHERE task_id=?
+           ORDER BY source_msg_id ASC LIMIT ?""",
+        (task_id, max(1, int(limit))))
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def count_failed_messages(db: Database, task_id: int) -> int:
+    cursor = await db.db.execute(
+        "SELECT COUNT(*) AS n FROM failed_messages WHERE task_id=?", (task_id,))
+    row = await cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
+async def get_tasks_with_failures(db: Database, limit: int = 10) -> list[dict]:
+    """有失败记录的任务概览（任务 + 失败条数）。"""
+    cursor = await db.db.execute(
+        """SELECT t.*, COUNT(f.id) AS failed_n
+           FROM tasks t JOIN failed_messages f ON f.task_id = t.id
+           WHERE t.status != 'deleted'
+           GROUP BY t.id
+           ORDER BY failed_n DESC, t.id DESC LIMIT ?""",
+        (max(1, int(limit)),))
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def get_all_active_tasks(db: Database) -> list[dict]:

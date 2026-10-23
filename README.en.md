@@ -11,7 +11,13 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 - **Channel Cloning** — Clone any channel/group (including forum topics) from the earliest message to the latest
 - **Selectable Start Point** — From the beginning, from a message ID, from a message ID **range**, from a date/time, or resume the previous run
 - **Live Progress** — Progress bar, percentage, speed and ETA, refreshed in place on a single message
+- **Integrity Report** — Every finished clone reports `source N / mapped M / coverage X% / gap K`, so an archive run tells you at a glance whether it got everything
+- **Retry Failed Items** — `/klfail` lists what failed and why; `/retryfail <id|all>` re-sends them without touching the resume cursor
 - **Resumable** — Pause, crash or restart and it continues from the saved cursor with no duplicates or gaps
+- **Idempotent** — A `UNIQUE(task_id, source_msg_id)` index on `message_map` plus a pre-send lookup means re-runs never duplicate messages in the target
+- **Stall Recovery** — Per-strategy timeout (1200s) stops a dead connection from freezing the task; an independent watchdog alerts you after 10 minutes without progress
+- **File Reference Refresh** — On `FILE_REFERENCE_EXPIRED` the message is re-fetched for a fresh reference and retried (up to 2 times), so long runs stop losing media in bulk
+- **Concurrency Gate** — Only one clone runs at a time by default (`clone.max_concurrent`); the rest queue, because parallel runs multiply FloodWait
 - **Records Never Disappear** — Finished clones (`completed`) stay in the clone task list, so you can `/kljx` to catch up or re-enable following at any time; deletion is a soft delete
 - **Auto Follow-After-Finish** — When a clone finishes it keeps watching for new messages (`clone.follow_after_finish`) and stays visible in the monitor list; toggle it per task with 🛰 / ⏹ in the task detail
 - **Link Parsing** — Send a `t.me/...` link in private chat to trigger forwarding; supports public/private channels, groups, comments, and forum topics
@@ -95,6 +101,8 @@ python main.py
 | `/jt <link>`                   | Follow new messages only (no history backfill)                                    |
 | `/kllb`                        | Clone task list (includes completed tasks — records are kept forever)             |
 | `/jtlb`                        | Monitor task list (includes follow-ups created from clone tasks)                  |
+| `/klfail`                      | Show tasks with failures; `/klfail 12` lists task #12's failed items and reasons  |
+| `/retryfail <id\|all>`         | Re-send failed items (keeps the resume cursor untouched)                          |
 | `/chapd`                       | Prompts you to forward a channel message here to identify title / @username / ID  |
 | `/chaid`                       | Prompts you to forward a channel message here to get its **ID** and **link**      |
 | `/help`                        | Show every command with its purpose                                               |

@@ -74,6 +74,22 @@ class StubForwarder:
             self.syncer._cancel_flags[self.task_id] = True
         return out
 
+    # 预取与自愈接口：真实 Forwarder 有，桩里保持空实现（测试不需要真下载）
+    def should_prefetch(self):
+        return False
+
+    async def prefetch_media(self, *args, **kwargs):
+        return None
+
+    def cleanup_prefetch(self):
+        return None
+
+    def strategy_summary(self):
+        return ""
+
+    def diagnostics_summary(self):
+        return ""
+
 
 class SyncerRunTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

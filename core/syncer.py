@@ -13,6 +13,7 @@
 """
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +43,7 @@ logger = logging.getLogger("tg_forward_bot.syncer")
 DEFAULT_BATCH_SIZE = 200          # 每批拉取消息数
 DEFAULT_PROGRESS_EVERY = 50       # 每 N 条刷新一次进度
 MAX_FLOOD_RETRIES = 5             # 单次运行内 FloodWait 最大重试轮数
+DEFAULT_STALL_SECONDS = 600       # 多少秒没有任何进展就告警（看门狗）
 
 
 @dataclass
@@ -74,6 +76,9 @@ class Syncer(ForwardingComponent):
             clone_cfg.get("progress_notify_every") or DEFAULT_PROGRESS_EVERY))
         # 克隆完成后回调（handlers 注入：默认自动开启持续监听）
         self.on_complete: Callable[[int], Awaitable[None]] | None = None
+        # 看门狗：多久没有任何进展就向用户告警一次（0 = 关闭）
+        self.stall_seconds = max(0, int(
+            clone_cfg.get("stall_alert_seconds", DEFAULT_STALL_SECONDS)))
 
     # ------------------------------------------------------------------
     # 起点解析
@@ -309,8 +314,37 @@ class Syncer(ForwardingComponent):
         unit_kind: str,
         source_ids: list[int],
         userbot: TelegramClient | None = None,
-    ) -> tuple[int, int, list[int]]:
-        """转发普通消息单元，返回 (msg_count, last_msg_id, target_ids)。"""
+    ) -> tuple[int, int, list[int], int]:
+        """转发普通消息单元，返回 (msg_count, last_msg_id, target_ids, skipped)。
+
+        `skipped` 是「已经克隆过、本次刻意不再发送」的条数：重跑/续补/超时重试
+        都可能把同一条再喂进来，没有这层幂等，私人频道里就会出现重复消息。
+        """
+        last_id = source_ids[-1]
+        mapped = await models.get_mapped_ids(self.db, task_id, source_ids)
+
+        if len(mapped) >= len(source_ids):
+            logger.info("跳过已克隆单元 kind=%s ids=%s", unit_kind, source_ids)
+            return 0, last_id, [], len(source_ids)
+
+        # 部分已映射（相册常见）：拆成单条补发，避免整组重发导致重复
+        if mapped and unit_kind == "album":
+            ok, target_ids = 0, []
+            for sid in source_ids:
+                if sid in mapped:
+                    continue
+                tgt = await self.forwarder.forward_message(
+                    source_chat_id, sid, target_chat_id, mode, target_topic_id,
+                    caller="syncer", userbot=userbot)
+                if tgt:
+                    ok += 1
+                    target_ids.append(tgt)
+                    await models.save_message_map(self.db, task_id, sid, tgt)
+                    await models.clear_failed_message(self.db, task_id, sid)
+                else:
+                    await self._record_failure(task_id, sid, "相册拆条补发失败")
+            return ok, last_id, target_ids, len(mapped)
+
         if unit_kind == "album":
             target_ids = await self.forwarder.forward_album(
                 source_chat_id, source_ids, target_chat_id, mode, target_topic_id,
@@ -318,7 +352,11 @@ class Syncer(ForwardingComponent):
             )
             for src_id, tgt_id in zip(source_ids, target_ids):
                 await models.save_message_map(self.db, task_id, src_id, tgt_id)
-            return len(target_ids), source_ids[-1], target_ids
+                await models.clear_failed_message(self.db, task_id, src_id)
+            if not target_ids:
+                for sid in source_ids:
+                    await self._record_failure(task_id, sid, "相册整组转发失败")
+            return len(target_ids), last_id, target_ids, 0
 
         source_msg_id = source_ids[0]
         target_msg_id = await self.forwarder.forward_message(
@@ -327,8 +365,102 @@ class Syncer(ForwardingComponent):
         )
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
-            return 1, source_msg_id, [target_msg_id]
-        return 0, source_msg_id, []
+            await models.clear_failed_message(self.db, task_id, source_msg_id)
+            return 1, source_msg_id, [target_msg_id], 0
+        await self._record_failure(task_id, source_msg_id, "所有转发策略均失败")
+        return 0, source_msg_id, [], 0
+
+    async def _record_failure(self, task_id: int, source_msg_id: int,
+                              reason: str) -> None:
+        """把失败消息登记到 failed_messages，供 /klfail 查看和 /retryfail 补发。"""
+        try:
+            await models.add_failed_message(self.db, task_id, source_msg_id, reason)
+        except Exception as e:
+            logger.debug("登记失败消息 id=%s 出错: %s", source_msg_id, e)
+
+    async def _record_failure_batch(self, task_id: int, source_ids: list[int],
+                                    reason: str) -> None:
+        for sid in source_ids:
+            await self._record_failure(task_id, sid, reason)
+
+    async def _stall_watchdog(self, task_id: int, state: dict, notify,
+                              cursor_getter: Callable[[], int],
+                              max_alerts: int = 3) -> None:
+        """独立协程：主循环长时间没有任何进展时告警。
+
+        为什么不放在循环里检查——真正卡死的时候循环本身已经不再执行了，
+        只有独立协程还活着，这是唯一还能告诉用户「它卡住了」的通道。
+        """
+        interval = max(30, min(120, self.stall_seconds // 4))
+        while True:
+            await asyncio.sleep(interval)
+            idle = time.monotonic() - state["beat"]
+            if idle < self.stall_seconds or state["alerts"] >= max_alerts:
+                continue
+            state["alerts"] += 1
+            minutes = int(idle // 60)
+            logger.warning("克隆任务 #%s 已 %d 分钟无进展（游标 %s）",
+                           task_id, minutes, cursor_getter())
+            try:
+                await notify(
+                    f"⚠️ 克隆任务 #{task_id} 已 {minutes} 分钟没有进展\n"
+                    f"游标停在 msg_id={cursor_getter()}\n"
+                    f"可能卡在下载/上传或连接假死；单条策略超过 "
+                    f"{self.forwarder.strategy_timeout}s 会自动止损继续下一条。\n"
+                    f"若长时间无变化，可暂停后 /kljx 从该 ID 续跑。")
+            except Exception as e:
+                logger.debug("看门狗告警发送失败: %s", e)
+
+    # ------------------------------------------------------------------
+    # 失败补发
+    # ------------------------------------------------------------------
+
+    async def retry_failed(self, task_id: int, *, limit: int = 300,
+                           userbot: TelegramClient | None = None
+                           ) -> tuple[int, int]:
+        """按失败清单补发，返回 (补成功条数, 仍失败条数)。
+
+        不动 `last_synced_msg_id`：补发的是历史缺口，不应该影响正常续跑游标。
+        """
+        task = await models.get_task(self.db, task_id)
+        if not task:
+            return 0, 0
+        rows = await models.list_failed_messages(self.db, task_id, limit=limit)
+        if not rows:
+            return 0, 0
+
+        source_chat_id = task["source_chat_id"]
+        target_chat_id = task["target_chat_id"]
+        target_topic_id = task.get("target_topic_id")
+        mode = task.get("mode") or "copy"
+        active_userbot = await self.get_active_userbot(source_chat_id, userbot)
+
+        ok = still = 0
+        for row in rows:
+            src_id = int(row["source_msg_id"])
+            try:
+                # 上次可能已经成功、只是没来得及清账
+                if await models.get_mapped_ids(self.db, task_id, [src_id]):
+                    await models.clear_failed_message(self.db, task_id, src_id)
+                    continue
+                tgt = await self.forwarder.forward_message(
+                    source_chat_id, src_id, target_chat_id, mode, target_topic_id,
+                    caller="syncer", userbot=active_userbot)
+                if tgt:
+                    await models.save_message_map(self.db, task_id, src_id, tgt)
+                    await models.clear_failed_message(self.db, task_id, src_id)
+                    await models.update_progress(self.db, task_id, done_delta=1)
+                    ok += 1
+                else:
+                    still += 1
+                    await self._record_failure(task_id, src_id, "补发重试仍失败")
+            except Exception as e:
+                still += 1
+                logger.warning("补发 msg=%s 异常: %s", src_id, e)
+                await self._record_failure(
+                    task_id, src_id, f"补发异常: {type(e).__name__}")
+        logger.info("任务 #%s 补发完成：成功 %d 条，仍失败 %d 条", task_id, ok, still)
+        return ok, still
 
     # ------------------------------------------------------------------
     # 公开入口
@@ -400,6 +532,8 @@ class Syncer(ForwardingComponent):
         flood_retries = 0
         # 跨批次/跨 FloodWait 重试保留，确保跳过的计数不丢
         counter = {"last_id": cursor, "skip": 0}
+        # 看门狗心跳：主循环每处理完一个单元就刷新，独立协程负责超时告警
+        state = {"beat": time.monotonic(), "alerts": 0}
 
         async def _render() -> str:
             elapsed = (datetime.now().astimezone() - started_at).total_seconds()
@@ -414,6 +548,12 @@ class Syncer(ForwardingComponent):
                 f"成功 {done - plan.done_before:,} · 失败 {failed:,} · 跳过 {skipped:,}\n"
                 f"已用 {format_duration(elapsed)} · 剩余约 {format_duration(eta)}"
             )
+
+        # 独立看门狗：真卡死时主循环已不再执行，只有独立协程还能发出告警
+        watchdog_task = None
+        if self.stall_seconds > 0:
+            watchdog_task = asyncio.create_task(
+                self._stall_watchdog(task_id, state, _notify, lambda: cursor))
 
         try:
             while True:
@@ -430,9 +570,18 @@ class Syncer(ForwardingComponent):
                         restriction_cache, _ = self._precheck_restricted_units(
                             chat_restricted, batch, units)
 
-                        for kind, source_ids in units:
+                        for unit_idx, (kind, source_ids) in enumerate(units):
                             if self._cancel_flags.get(task_id):
                                 break
+
+                            # 下载预取：处理当前单元时，让下一条的下载在后台先跑起来，
+                            # 与本次上传重叠（策略3 才有意义，其余路径不会命中该开关）
+                            if unit_idx + 1 < len(units):
+                                nxt_kind, nxt_ids = units[unit_idx + 1]
+                                if nxt_kind != "album" and len(nxt_ids) == 1 \
+                                        and self.forwarder.should_prefetch():
+                                    await self.forwarder.prefetch_media(
+                                        source_chat_id, nxt_ids[0], active_userbot)
 
                             is_restricted, _field = restriction_cache.get(
                                 source_ids[0], (False, ""))
@@ -449,6 +598,9 @@ class Syncer(ForwardingComponent):
                                         await models.update_progress(
                                             self.db, task_id, last_msg_id=cursor,
                                             fail_delta=len(source_ids))
+                                        await self._record_failure_batch(
+                                            task_id, source_ids, "Takeout 开启失败")
+                                        state["beat"] = time.monotonic()
                                         continue
                                 ok_count, last_id, target_ids = await self._forward_restricted_unit(
                                     takeout, task_id, source_chat_id,
@@ -466,33 +618,43 @@ class Syncer(ForwardingComponent):
                                     await models.update_progress(
                                         self.db, task_id, last_msg_id=cursor,
                                         fail_delta=len(source_ids))
+                                    await self._record_failure_batch(
+                                        task_id, source_ids, "Takeout 转发失败")
                                 self._log_forward_result(
                                     logger, "clone", task_id, kind, source_ids,
                                     target_ids, restricted=True)
                             else:
-                                ok_count, last_id, target_ids = await self._forward_unit(
-                                    task_id=task_id,
-                                    source_chat_id=source_chat_id,
-                                    target_chat_id=target_chat_id,
-                                    mode=mode,
-                                    target_topic_id=target_topic_id,
-                                    unit_kind=kind,
-                                    source_ids=source_ids,
-                                    userbot=active_userbot,
-                                )
+                                ok_count, last_id, target_ids, dup_count = \
+                                    await self._forward_unit(
+                                        task_id=task_id,
+                                        source_chat_id=source_chat_id,
+                                        target_chat_id=target_chat_id,
+                                        mode=mode,
+                                        target_topic_id=target_topic_id,
+                                        unit_kind=kind,
+                                        source_ids=source_ids,
+                                        userbot=active_userbot,
+                                    )
                                 cursor = last_id
+                                if dup_count:
+                                    skipped += dup_count
+                                    await models.update_progress(
+                                        self.db, task_id, last_msg_id=cursor,
+                                        skip_delta=dup_count)
                                 if target_ids:
                                     done += ok_count
                                     await models.update_progress(
                                         self.db, task_id, last_msg_id=cursor,
                                         done_delta=ok_count)
-                                else:
+                                elif not dup_count:
                                     failed += len(source_ids)
                                     await models.update_progress(
                                         self.db, task_id, last_msg_id=cursor,
                                         fail_delta=len(source_ids))
                                 self._log_forward_result(
                                     logger, "clone", task_id, kind, source_ids, target_ids)
+
+                            state["beat"] = time.monotonic()
 
                             if done - last_progress_at >= self.progress_every:
                                 last_progress_at = done
@@ -530,6 +692,12 @@ class Syncer(ForwardingComponent):
             logger.info("克隆任务 #%s 被取消，游标停在 %s", task_id, cursor)
             raise
         finally:
+            if watchdog_task:
+                watchdog_task.cancel()
+            try:
+                self.forwarder.cleanup_prefetch()
+            except Exception as e:
+                logger.debug("清理预取缓存失败: %s", e)
             await self._close_takeout(takeout)
 
         await models.update_progress(self.db, task_id, last_msg_id=cursor)
@@ -559,13 +727,33 @@ class Syncer(ForwardingComponent):
             restricted_line += f"，失败 {restricted_fail:,} 条"
         summary = self.forwarder.strategy_summary() if hasattr(self.forwarder, "strategy_summary") else ""
         strategy_line = f"\n• 策略分布: {summary}" if summary else ""
+        diag = (self.forwarder.diagnostics_summary()
+                if hasattr(self.forwarder, "diagnostics_summary") else "")
+        diag_line = f"\n• 自愈: {diag}" if diag else ""
+
+        # 完整性校验：源范围内应该有多少条 vs 实际落地了多少条。
+        # 存档型用途最关心的就是这行——「到底抓全了没有」。
+        mapped = await models.count_message_map(self.db, task_id)
+        expected = plan.total or done
+        # skipped 是服务消息/空消息（本来就不该落地），从分母里去掉才公平
+        denom = max(1, expected - skipped)
+        coverage = min(100.0, mapped / denom * 100)
+        gap = max(0, expected - skipped - mapped)
+        integrity_line = (
+            f"\n📊 完整性: 源 {expected:,} 条 · 已映射 {mapped:,} 条"
+            f" · 覆盖率 {coverage:.1f}%")
+        if gap:
+            integrity_line += f" · 缺口 {gap:,} 条（/klfail 查看，/retryfail 补）"
+
         await _report(
             "✅ 克隆完成"
             f"\n{progress_bar(done, plan.total or done)}"
             f"\n• 本次新增: {done - plan.done_before:,} 条"
             f"{restricted_line}"
             f"\n• 失败: {failed:,} 条 · 跳过: {skipped:,} 条"
+            f"{integrity_line}"
             f"{strategy_line}"
+            f"{diag_line}"
             f"\n• 最终游标: msg_id={cursor}")
 
         # 完成后默认转「持续监听」（handlers 注入的钩子，未设置则什么都不做）

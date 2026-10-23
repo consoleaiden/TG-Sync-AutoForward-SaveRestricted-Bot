@@ -48,6 +48,18 @@ transfer:
   userbot_max_flood: 3 # 连续 N 次 UserBot FloodWait 后，本次运行停用 UserBot 转发
   userbot_flood_buffer: 5 # UserBot 遇 FloodWait 时额外多等的秒数（别贴着红线跑）
   probe_ttl_seconds: 1800 # 「Bot 读不到源 / UserBot 不能发目标」判定的缓存时长
+  # ↓ 可选：目标是「自己的频道」时，让 UserBot 服务端转发送先。默认关闭。
+  #   策略1（Bot 直接转发）同样是服务端搬运、不占本机带宽，单条约 0.3s；
+  #   UserBot 有 3~6s 独立节奏，提前反而慢一个数量级。只有当「Bot 能在源里读、
+  #   却在目标里发不出（被限制/无发言权）」时才值得打开，可省掉每条一次的失败探测。
+  prefer_userbot_on_own_target: false
+  # 单条策略最长耗时（秒）。半开连接/TCP 假死时 Telethon 请求可能永久挂住，
+  # 超时后放弃该策略继续降级，避免整个任务停在一个游标上不动。0 = 不限制
+  strategy_timeout: 1200
+  # 媒体引用过期后的重试次数：重取消息刷新 file_reference 再试（克隆大频道必备）
+  file_ref_retries: 2
+  # 下载预取深度：策略3 连续命中时，提前下载下一条与本次上传重叠（0 = 关闭）
+  prefetch_ahead: 1
 
 # 是否允许非管理员使用链接解析
 allow_public_resolve: true
@@ -76,6 +88,11 @@ clone:
   batch_size: 200
   # 每成功转发 N 条刷新一次进度显示（会编辑同一条消息，不会刷屏）
   progress_notify_every: 50
+  # 同时最多跑几个克隆任务（默认 1）。每个任务自带一个限流器，同时跑 N 个
+  # 实际频率就是设计值 × N，FloodWait 会成倍到来——排队比并行安全。
+  max_concurrent: 1
+  # 多久没有任何进展就告警一次（秒）。真正卡死时循环已停，靠独立看门狗发通知
+  stall_alert_seconds: 600
   # 克隆跑完后自动转为「持续监听」后续新消息（任务详情里可单独关闭）
   follow_after_finish: true
 

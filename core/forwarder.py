@@ -18,7 +18,9 @@
 """
 import asyncio
 import logging
+import os
 import random
+import shutil
 import tempfile
 import time
 from collections import Counter
@@ -73,6 +75,10 @@ SOURCE_READ_ERRORS = _error_classes(
 BOT_WRITE_ERRORS = _error_classes(
     "ChatWriteForbiddenError", "ChatAdminRequiredError",
 )
+# 媒体引用过期/失效：必须重取消息刷新 file_reference 再试，否则这条媒体就永久丢了
+FILE_REF_ERRORS = _error_classes(
+    "FileReferenceExpiredError", "FileReferenceInvalidError",
+)
 
 
 
@@ -116,6 +122,22 @@ class Forwarder:
         # 能力判定缓存有效期：避免每条消息都撞一次注定失败的权限错误
         self.probe_ttl_seconds = max(30, int(transfer_cfg.get("probe_ttl_seconds", 1800)))
 
+        # ── 可选：目标是自己的频道时，让 UserBot 服务端转发送先 ──────────────
+        # 默认关闭。原因：策略1（Bot 直接转发）本身就是服务端搬运，不占本机带宽，
+        # 单条耗时约 0.3s；而 UserBot 受 3~6s 独立节奏限制，强行提前反而慢 10 倍。
+        # 只有在「Bot 能在源里读、却在目标里发不出（被限制/无发言权）」这种
+        # 特殊组合下，提前才有意义——那种场景 Bot 会先失败再降级，手动打开此开关
+        # 可以省掉每条一次的失败探测。
+        self.prefer_userbot_on_own_target = bool(
+            transfer_cfg.get("prefer_userbot_on_own_target", False))
+
+        # 单条策略超时：防「死连接/半开 TCP」把整个任务挂死。0 = 不限制
+        self.strategy_timeout = max(0, int(transfer_cfg.get("strategy_timeout", 1200)))
+        # 媒体引用过期后的重试次数（重取消息刷新 file_reference）
+        self.file_ref_retries = max(0, int(transfer_cfg.get("file_ref_retries", 2)))
+        # 下载预取深度：策略3 连续命中时，提前下载后续 1 条与上传重叠
+        self.prefetch_ahead = max(0, int(transfer_cfg.get("prefetch_ahead", 1)))
+
         self._bot_unreadable: dict[int, float] = {}   # source -> 判定时间
         self._bot_readable: dict[int, float] = {}     # source -> 判定时间
         self._ub_write_blocked: dict[int, float] = {}  # target -> 判定时间
@@ -123,6 +145,12 @@ class Forwarder:
         self._ub_floods = 0
         self._ub_forward_disabled = False
         self.strategy_counts: Counter[str] = Counter()
+        self.strategy_timeouts = 0
+        self.ref_retries = 0
+        # 预取缓存：key=(source_chat_id, msg_id) -> {"path","tmpdir","task"}
+        self._prefetch: dict[tuple[int, int], dict] = {}
+        # 最近若干条命中策略3 的次数，用来决定「要不要开始预取」
+        self._recent_download_hits = 0
 
         self.media = MediaTransferHelper(
             bot=self.bot,
@@ -244,6 +272,35 @@ class Forwarder:
             return "entity" in text or "peer" in text
         return False
 
+    def _should_prefer_userbot(self, source_chat_id: int, target_chat_id: int,
+                               userbot: TelegramClient | None,
+                               caller: str = "syncer") -> bool:
+        """目标是自己频道时，是否让 UserBot 服务端转发送先。
+
+        只做「顺序调整」不改链路：一旦 UserBot 那条路不通（无发言权/禁止转发），
+        策略2 会自己返回 None，循环继续走策略1（Bot 直接），行为仍然收敛。
+        """
+        if not self.prefer_userbot_on_own_target:
+            return False
+        if target_chat_id >= 0:
+            # 私聊 / 普通群：既有 Bot 切片规则更稳，保持原顺序
+            return False
+        if caller == "private":
+            return False
+        return self._userbot_forward_skip_reason(
+            source_chat_id, target_chat_id, userbot or self.userbot, caller) is None
+
+    def should_prefetch(self) -> bool:
+        """最近一段时间策略3 占主导时，才值得提前下载（否则预取全是白耗带宽）。"""
+        return self.prefetch_ahead > 0 and self._recent_download_hits >= 3
+
+    def _note_strategy_hit(self, key: str) -> None:
+        """记录最近策略命中，用于判断是否进入「下载型」工作模式。"""
+        if key == ST_DOWNLOAD:
+            self._recent_download_hits = min(10, self._recent_download_hits + 1)
+        elif key in (ST_BOT, ST_UB_FORWARD):
+            self._recent_download_hits = max(0, self._recent_download_hits - 1)
+
     def strategy_summary(self) -> str:
         """本次运行各策略命中次数（用于任务完成消息）。"""
         parts = [
@@ -251,6 +308,15 @@ class Forwarder:
             for key in (ST_BOT, ST_UB_FORWARD, ST_UB_COPY, ST_DOWNLOAD)
             if self.strategy_counts.get(key)
         ]
+        return " · ".join(parts)
+
+    def diagnostics_summary(self) -> str:
+        """自愈类事件计数：超时止损 / 媒体引用刷新。"""
+        parts = []
+        if self.strategy_timeouts:
+            parts.append(f"超时止损 {self.strategy_timeouts} 次")
+        if self.ref_retries:
+            parts.append(f"引用刷新 {self.ref_retries} 次")
         return " · ".join(parts)
 
     # ------------------------------------------------------------------
@@ -418,13 +484,10 @@ class Forwarder:
             (ST_DOWNLOAD, "策略3(下载+上传)", self._try_userbot_download_bot_upload,
              (source_chat_id, msg_id, target_chat_id, target_topic_id, userbot)),
         ]
-        for key, strategy_name, strategy_func, args in strategies:
-            result = await strategy_func(*args)
-            if result is not None:
-                self.strategy_counts[key] += 1
-                logger.info("msg=%s %s成功 -> target_msg=%s", msg_id, strategy_name, result)
-                return result
-        return None
+        if self._should_prefer_userbot(source_chat_id, target_chat_id, userbot, caller):
+            strategies[0], strategies[1] = strategies[1], strategies[0]
+        return await self._run_strategies(
+            strategies, f"msg={msg_id}", is_album=False)
 
     async def _run_album_strategies(self, source_chat_id: int, msg_ids: list[int],
                                     target_chat_id: int, mode: str,
@@ -441,13 +504,41 @@ class Forwarder:
             (ST_DOWNLOAD, "策略3(下载+上传)", self._try_userbot_download_bot_upload_album,
              (source_chat_id, msg_ids, target_chat_id, target_topic_id, userbot)),
         ]
+        if self._should_prefer_userbot(source_chat_id, target_chat_id, userbot, caller):
+            strategies[0], strategies[1] = strategies[1], strategies[0]
+        return await self._run_strategies(
+            strategies, f"album={msg_ids}", is_album=True)
+
+    async def _run_strategies(self, strategies: list, label: str,
+                              *, is_album: bool):
+        """按顺序尝试各策略，单条超时后继续降级。
+
+        超时的意义不在提速，而在「止损」：半开连接/TCP 假死时 Telethon 的请求
+        可以永久挂住，一个挂住的请求会让整个克隆任务停在同一游标上不动。
+        """
         for key, strategy_name, strategy_func, args in strategies:
-            result = await strategy_func(*args)
+            try:
+                result = await self._call_with_timeout(
+                    strategy_func, args, f"{strategy_name} {label}")
+            except asyncio.TimeoutError:
+                self.strategy_timeouts += 1
+                logger.warning("%s %s 超时 %ds，跳过该策略继续降级",
+                               label, strategy_name, self.strategy_timeout)
+                continue
             if result:
                 self.strategy_counts[key] += 1
-                logger.info("album=%s %s成功 -> target_msgs=%s", msg_ids, strategy_name, result)
+                self._note_strategy_hit(key)
+                logger.info("%s %s成功 -> %s", label, strategy_name,
+                            result if is_album else result)
                 return result
-        return []
+        return [] if is_album else None
+
+    async def _call_with_timeout(self, func, args: tuple, label: str):
+        """按 transfer.strategy_timeout 限制单次策略耗时（0 表示不限制）。"""
+        if self.strategy_timeout <= 0:
+            return await func(*args)
+        return await asyncio.wait_for(func(*args), timeout=self.strategy_timeout)
+
 
     async def _try_bot_direct(self, source_chat_id, msg_id,
                               target_chat_id, mode, topic_id,
@@ -795,8 +886,10 @@ class Forwarder:
             if not msg:
                 logger.info("策略2b: msg=%s UserBot 无法获取消息", msg_id)
                 return None
-            result = await self._copy_message(
-                self.bot, msg, target_chat_id, topic_id)
+            result = await self._with_fresh_ref(
+                ub, source_chat_id, msg_id,
+                lambda m: self._copy_message(self.bot, m, target_chat_id, topic_id),
+                label="策略2b", initial=msg)
             return result.id if result else None
         except errors.ChatForwardsRestrictedError:
             logger.info("策略2b: msg=%s 转发受限", msg_id)
@@ -823,7 +916,10 @@ class Forwarder:
             if not msgs:
                 logger.info("策略2b相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
-            result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
+            result = await self._with_fresh_ref_list(
+                ub, source_chat_id, msg_ids,
+                lambda ms: self._copy_album(self.bot, ms, target_chat_id, topic_id),
+                label="策略2b相册", initial=msgs)
             return self._extract_result_ids(result)
         except errors.ChatForwardsRestrictedError:
             logger.info("策略2b相册: 转发受限")
@@ -847,30 +943,11 @@ class Forwarder:
             if not msg:
                 logger.info("策略3: msg=%s UserBot 无法获取消息", msg_id)
                 return None
-
-            reply_to = self._reply_to(topic_id)
-
-            if is_file_media(msg):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    path = await self.media.download_media_to_path(msg, tmpdir, userbot=ub)
-                    if path:
-                        thumb_path = await self.media.download_video_thumb_to_path(msg, tmpdir, userbot=ub)
-                        send_kwargs = self.media.build_send_file_kwargs(
-                            msg, reply_to, thumb_path=thumb_path
-                        )
-                        result = await self.media.send_file_with_compat(
-                            target_chat_id, path, **send_kwargs
-                        )
-                        return result.id if result else None
-                    else:
-                        logger.warning("策略3: msg=%s 媒体下载失败", msg_id)
-            elif msg.text:
-                result = await self.bot.send_message(
-                    target_chat_id, msg.text, reply_to=reply_to)
-                return result.id if result else None
-            else:
-                logger.info("策略3: msg=%s 消息无文本也无媒体", msg_id)
-            return None
+            return await self._with_fresh_ref(
+                ub, source_chat_id, msg_id,
+                lambda m: self._download_and_upload(
+                    ub, m, source_chat_id, target_chat_id, topic_id),
+                label="策略3", initial=msg)
         except errors.FloodWaitError as e:
             return await self._handle_flood(e, self._try_userbot_download_bot_upload,
                                             source_chat_id, msg_id,
@@ -878,6 +955,139 @@ class Forwarder:
         except Exception as e:
             logger.warning("策略3: msg=%s 异常: %s", msg_id, e)
             return None
+
+    async def _download_and_upload(self, ub: TelegramClient, msg: Message,
+                                   source_chat_id: int, target_chat_id: int,
+                                   topic_id: int | None) -> int | None:
+        """单条媒体：优先用预取结果（下载已与上一条的上传重叠），否则现下现传。"""
+        reply_to = self._reply_to(topic_id)
+        msg_id = msg.id
+
+        if is_file_media(msg):
+            prefetched = await self._take_prefetch(source_chat_id, msg_id)
+            if prefetched:
+                path, pf_tmpdir = prefetched
+                logger.info("策略3: msg=%s 命中预取缓存，跳过下载", msg_id)
+                try:
+                    thumb_path = await self.media.download_video_thumb_to_path(
+                        msg, pf_tmpdir, userbot=ub)
+                    send_kwargs = self.media.build_send_file_kwargs(
+                        msg, reply_to, thumb_path=thumb_path)
+                    result = await self.media.send_file_with_compat(
+                        target_chat_id, path, **send_kwargs)
+                    return result.id if result else None
+                finally:
+                    shutil.rmtree(pf_tmpdir, ignore_errors=True)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = await self.media.download_media_to_path(msg, tmpdir, userbot=ub)
+                if not path:
+                    logger.warning("策略3: msg=%s 媒体下载失败", msg_id)
+                    return None
+                thumb_path = await self.media.download_video_thumb_to_path(
+                    msg, tmpdir, userbot=ub)
+                send_kwargs = self.media.build_send_file_kwargs(
+                    msg, reply_to, thumb_path=thumb_path)
+                result = await self.media.send_file_with_compat(
+                    target_chat_id, path, **send_kwargs)
+                return result.id if result else None
+
+        if msg.text:
+            result = await self.bot.send_message(
+                target_chat_id, msg.text, reply_to=reply_to)
+            return result.id if result else None
+
+        logger.info("策略3: msg=%s 消息无文本也无媒体", msg_id)
+        return None
+
+    # ------------------------------------------------------------------
+    # 下载预取（让「下载第 N+1 条」与「上传第 N 条」重叠）
+    # ------------------------------------------------------------------
+
+    async def prefetch_media(self, source_chat_id: int, msg_id: int,
+                             userbot: TelegramClient | None = None) -> None:
+        """后台提前下载一条媒体，供紧接着的策略3 直接取用。
+
+        策略3 原本是严格串行（取消息 → 下载 → 上传），单条大文件里上传占一半时间，
+        这段时间 UserBot 完全空闲。预取把两条消息的下载/上传叠在一起，
+        媒体型频道的实际耗时约减半。
+        """
+        if not self.should_prefetch():
+            return
+        key = (source_chat_id, msg_id)
+        if key in self._prefetch:
+            return
+        if len(self._prefetch) >= max(1, self.prefetch_ahead):
+            return
+        entry: dict = {"task": None, "path": None, "tmpdir": None}
+        self._prefetch[key] = entry
+        entry["task"] = asyncio.create_task(
+            self._prefetch_worker(key, source_chat_id, msg_id, userbot))
+
+    async def _prefetch_worker(self, key, source_chat_id: int, msg_id: int,
+                               userbot: TelegramClient | None) -> None:
+        ub = userbot or self.userbot
+        tmpdir = tempfile.mkdtemp(prefix="tg_prefetch_")
+        entry = self._prefetch.get(key)
+        try:
+            msg = await self._get_single_message(ub, source_chat_id, msg_id)
+            if not msg or not is_file_media(msg):
+                self._drop_prefetch(key, tmpdir)
+                return
+            path = await self.media.download_media_to_path(msg, tmpdir, userbot=ub)
+            if not path or entry is None:
+                self._drop_prefetch(key, tmpdir)
+                return
+            entry["path"] = path
+            entry["tmpdir"] = tmpdir
+            logger.debug("预取完成 msg=%s -> %s", msg_id, os.path.basename(path))
+        except asyncio.CancelledError:
+            self._drop_prefetch(key, tmpdir)
+            raise
+        except Exception as e:
+            logger.debug("预取失败 msg=%s: %s", msg_id, e)
+            self._drop_prefetch(key, tmpdir)
+
+    def _drop_prefetch(self, key, tmpdir: str | None = None) -> None:
+        entry = self._prefetch.pop(key, None)
+        for d in {(entry or {}).get("tmpdir"), tmpdir}:
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+    async def _take_prefetch(self, source_chat_id: int,
+                             msg_id: int) -> tuple[str, str] | None:
+        """取走预取结果；若还在下载就等它完成（此时已下载了一段时间）。"""
+        entry = self._prefetch.pop((source_chat_id, msg_id), None)
+        if not entry:
+            return None
+        task = entry.get("task")
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=300)
+            except Exception as e:
+                logger.debug("等待预取完成失败 msg=%s: %s", msg_id, e)
+                self._discard_entry(entry)
+                return None
+        path, tmpdir = entry.get("path"), entry.get("tmpdir")
+        if path and os.path.exists(path):
+            return path, tmpdir
+        self._discard_entry(entry)
+        return None
+
+    @staticmethod
+    def _discard_entry(entry: dict) -> None:
+        task = entry.get("task")
+        if task and not task.done():
+            task.cancel()
+        if entry.get("tmpdir"):
+            shutil.rmtree(entry["tmpdir"], ignore_errors=True)
+
+    def cleanup_prefetch(self) -> None:
+        """任务结束/异常时清掉所有预取任务与临时目录。"""
+        for key in list(self._prefetch):
+            entry = self._prefetch.pop(key)
+            self._discard_entry(entry)
+
 
     async def _try_userbot_download_bot_upload_album(self, source_chat_id, msg_ids,
                                                      target_chat_id, topic_id,
@@ -889,41 +1099,11 @@ class Forwarder:
             if not msgs:
                 logger.info("策略3相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
-
-            reply_to = self._reply_to(topic_id)
-            media_msgs = [m for m in msgs if is_file_media(m)]
-            if not media_msgs:
-                logger.info("策略3相册: 无可下载媒体")
-                return []
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                ok_items = await self._download_album_media(media_msgs, tmpdir, userbot=ub)
-                if not ok_items:
-                    logger.warning("策略3相册: 媒体下载失败")
-                    return []
-
-                ordered_items = sorted(ok_items, key=lambda item: item[0])
-                captions = [m.text or "" for _, m, _, _ in ordered_items]
-
-                files = []
-                for _, message, path, thumb_path in ordered_items:
-                    item = await self.media.prepare_album_media_item(
-                        message, path, thumb_path=thumb_path
-                    )
-                    files.append(item)
-
-                has_video = any(self.media.is_video_message(m) for m in media_msgs)
-                logger.info("策略3相册上传: 待发 %d 个文件, has_video=%s supports_streaming=%s",
-                            len(files), has_video, has_video)
-                result = await self.media.send_file_with_compat(
-                    target_chat_id,
-                    files,
-                    caption=captions,
-                    reply_to=reply_to,
-                    part_size_kb=self.upload_part_size_kb,
-                    supports_streaming=has_video,
-                )
-                return self._extract_result_ids(result)
+            return await self._with_fresh_ref_list(
+                ub, source_chat_id, msg_ids,
+                lambda ms: self._download_album_and_upload(
+                    ub, ms, target_chat_id, topic_id),
+                label="策略3相册", initial=msgs)
         except errors.FloodWaitError as e:
             return await self._handle_flood(
                 e, self._try_userbot_download_bot_upload_album,
@@ -931,6 +1111,44 @@ class Forwarder:
         except Exception as e:
             logger.warning("策略3相册: 异常: %s", e)
             return []
+
+    async def _download_album_and_upload(self, ub: TelegramClient, msgs: list,
+                                         target_chat_id: int,
+                                         topic_id: int | None) -> list[int]:
+        reply_to = self._reply_to(topic_id)
+        media_msgs = [m for m in msgs if is_file_media(m)]
+        if not media_msgs:
+            logger.info("策略3相册: 无可下载媒体")
+            return []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok_items = await self._download_album_media(media_msgs, tmpdir, userbot=ub)
+            if not ok_items:
+                logger.warning("策略3相册: 媒体下载失败")
+                return []
+
+            ordered_items = sorted(ok_items, key=lambda item: item[0])
+            captions = [m.text or "" for _, m, _, _ in ordered_items]
+
+            files = []
+            for _, message, path, thumb_path in ordered_items:
+                item = await self.media.prepare_album_media_item(
+                    message, path, thumb_path=thumb_path
+                )
+                files.append(item)
+
+            has_video = any(self.media.is_video_message(m) for m in media_msgs)
+            logger.info("策略3相册上传: 待发 %d 个文件, has_video=%s supports_streaming=%s",
+                        len(files), has_video, has_video)
+            result = await self.media.send_file_with_compat(
+                target_chat_id,
+                files,
+                caption=captions,
+                reply_to=reply_to,
+                part_size_kb=self.upload_part_size_kb,
+                supports_streaming=has_video,
+            )
+            return self._extract_result_ids(result)
 
     async def build_source_link(self, source_chat_id: int, msg_id: int,
                                 userbot: TelegramClient | None = None) -> str:
@@ -1135,6 +1353,72 @@ class Forwarder:
                                   chat_or_entity, msg_id: int) -> Message | None:
         msg = await client.get_messages(chat_or_entity, ids=msg_id)
         return msg if msg else None
+
+    async def _refetch_message(self, client: TelegramClient,
+                               source_chat_id, msg_id: int) -> Message | None:
+        """重取消息以拿到新的 file_reference（服务端每次都会下发最新引用）。"""
+        try:
+            return await self._get_single_message(client, source_chat_id, msg_id)
+        except Exception as e:
+            logger.warning("重取消息失败 msg=%s: %s", msg_id, e)
+            return None
+
+    async def _with_fresh_ref(self, client: TelegramClient, source_chat_id,
+                              msg_id: int, action, *, label: str = "",
+                              initial: Message | None = None):
+        """执行 action(msg)；媒体引用过期时重取消息刷新引用后再试。
+
+        Telethon 不会自动刷新 file_reference：一条消息被引用超过一段时间
+        （或被重新上传）后，旧引用会一直报 FILE_REFERENCE_EXPIRED。
+        克隆大频道时后半段媒体成批失败，基本都是这个原因，而它原本被
+        `except Exception` 吞掉，表现为「这条消息凭空消失」。
+        """
+        msg = initial or await self._get_single_message(client, source_chat_id, msg_id)
+        if not msg:
+            return None
+        for attempt in range(self.file_ref_retries + 1):
+            try:
+                return await action(msg)
+            except FILE_REF_ERRORS as e:
+                if attempt >= self.file_ref_retries:
+                    logger.warning("%s msg=%s 引用失效且重试 %d 次仍失败: %s",
+                                   label, msg_id, self.file_ref_retries, e)
+                    raise
+                self.ref_retries += 1
+                logger.info("%s msg=%s 媒体引用过期，重取消息刷新（第 %d/%d 次）",
+                            label, msg_id, attempt + 1, self.file_ref_retries)
+                await asyncio.sleep(1 + attempt)
+                fresh = await self._refetch_message(client, source_chat_id, msg_id)
+                if not fresh:
+                    raise
+                msg = fresh
+        return None
+
+    async def _with_fresh_ref_list(self, client: TelegramClient, source_chat_id,
+                                   msg_ids: list[int], action, *,
+                                   label: str = "", initial: list | None = None):
+        """相册版的引用刷新重试。"""
+        msgs = initial or await self._get_message_list(client, source_chat_id, msg_ids)
+        if not msgs:
+            return []
+        for attempt in range(self.file_ref_retries + 1):
+            try:
+                return await action(msgs)
+            except FILE_REF_ERRORS as e:
+                if attempt >= self.file_ref_retries:
+                    logger.warning("%s msgs=%s 引用失效且重试 %d 次仍失败: %s",
+                                   label, msg_ids, self.file_ref_retries, e)
+                    raise
+                self.ref_retries += 1
+                logger.info("%s msgs=%s 媒体引用过期，重取整组刷新（第 %d/%d 次）",
+                            label, msg_ids, attempt + 1, self.file_ref_retries)
+                await asyncio.sleep(1 + attempt)
+                fresh = await self._get_message_list(
+                    client, source_chat_id, msg_ids)
+                if not fresh:
+                    raise
+                msgs = fresh
+        return []
 
     async def _get_single_message_for_bot(
         self,
