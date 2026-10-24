@@ -404,3 +404,20 @@ async def get_tasks_for_list(db: Database, types: tuple[str, ...],
 async def get_interrupted_clones(db: Database) -> list[dict]:
     """进程重启前仍处于 running 的克隆任务（需要自动续传）。"""
     return await get_tasks_by_types(db, CLONE_TASK_TYPES, ("running",))
+
+
+async def get_setting(db: Database, key: str) -> str | None:
+    cursor = await db.db.execute(
+        "SELECT value FROM app_settings WHERE key = ?", (key,))
+    row = await cursor.fetchone()
+    return row["value"] if row else None
+
+
+async def set_setting(db: Database, key: str, value: str) -> None:
+    await db.db.execute(
+        """INSERT INTO app_settings (key, value, updated_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+               updated_at = CURRENT_TIMESTAMP""",
+        (key, value))
+    await db.db.commit()

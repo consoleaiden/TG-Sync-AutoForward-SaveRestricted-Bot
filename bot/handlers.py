@@ -6,10 +6,13 @@
 """
 import asyncio
 import html
+import json
 import logging
 import os
 import re
 import time
+
+import yaml
 
 from telethon import TelegramClient, events, errors, Button, utils
 from telethon.tl import types
@@ -43,7 +46,13 @@ from core.syncer import Syncer
 from core.restricted_syncer import RestrictedSyncer
 from core.monitor import MonitorManager
 from core.rate_limiter import _get_dynamic_rate_limit
-from core.speed_config import apply_speed, parse_speed_args
+from core.config_store import (
+    apply_overlay, async_load_overlay, async_save_overlay, parse_value,
+)
+from core.speed_config import (
+    OVERRIDE_KEY, apply_speed, merge_overrides, normalize_overrides,
+    parse_speed_args,
+)
 from core.userbot_manager import UserBotManager
 from db.database import Database
 from db import models
@@ -248,6 +257,25 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     # FloodWait 会成倍到来——排队比并行更安全。
     max_concurrent = max(1, int((config.get("clone") or {}).get("max_concurrent", 1)))
     _clone_gate = asyncio.Semaphore(max_concurrent)
+    # /sd 覆盖值要同时作用到所有 RateLimiter 实例（每个组件各持一个）
+    _rate_limiters = [monitor_manager.rl, syncer.rl, restricted_syncer.rl]
+
+    async def _load_speed_overrides() -> None:
+        """启动时从数据库恢复 /sd 保存的速度覆盖值。"""
+        try:
+            raw = await models.get_setting(db, OVERRIDE_KEY)
+            ov = normalize_overrides(json.loads(raw)) if raw else {}
+        except Exception:
+            ov = {}
+        if ov:
+            for rl in _rate_limiters:
+                rl.set_overrides(ov)
+            logger.info("已恢复速度覆盖值: %s", sorted(ov))
+
+    try:
+        asyncio.get_running_loop().create_task(_load_speed_overrides())
+    except RuntimeError:
+        pass  # 无事件循环（极端场景），跳过恢复，/sd 设置时仍会即时生效
 
     def is_admin(user_id: int) -> bool:
         return user_id in admin_ids
@@ -1692,7 +1720,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             text.append("仍失败的条目通常是源消息已删除、超出体积上限或仍被限制。")
         await event.reply("\n".join(text))
 
-    def _speed_status(rl: dict) -> str:
+    def _speed_status(rl: dict, overrides: dict | None = None) -> str:
         def rng(v) -> str:
             if isinstance(v, list):
                 return f"{v[0]}~{v[1]} 秒"
@@ -1703,10 +1731,15 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         ui = rl.get("userbot_forward_interval", [3, 6])
         ue = rl.get("userbot_forward_pause_every", 25)
         ut = rl.get("userbot_forward_pause_time", [60, 120])
+        ov_line = ""
+        if overrides:
+            ov_line = (f"\n🟢 在线覆盖生效中: {'、'.join(sorted(overrides))}"
+                       "（优先于 config.yaml，重启自动恢复）\n")
         return (
             "⚙️ 当前克隆速度阈值（改动立即生效，无需重启）\n"
             f"【Bot】每条间隔 {rng(bi)} · 每 {be} 条歇 {rng(bt)}\n"
-            f"【UserBot】每条间隔 {rng(ui)} · 每 {ue} 条歇 {rng(ut)}\n\n"
+            f"【UserBot】每条间隔 {rng(ui)} · 每 {ue} 条歇 {rng(ut)}\n"
+            f"{ov_line}\n"
             "用法：\n"
             "• /sd bot fast — Bot 提速（0.3~0.8s/条，每 100 条歇 20~40s）\n"
             "• /sd bot max — Bot 全速（基本不等待，易触发 FloodWait，慎用）\n"
@@ -1720,7 +1753,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.NewMessage(pattern=r"^/sd(?:@\w+)?(?=\s|$)"))
     async def on_speed(event):
-        """查看/设置克隆转发速度阈值（写入 config.yaml，RateLimiter 热读取）。"""
+        """查看/设置克隆转发速度阈值（数据库持久化，所有限流器立即生效）。"""
         if not await _require_admin(event):
             return
         rest = event.raw_text.split(maxsplit=1)
@@ -1730,22 +1763,106 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             await event.reply(payload)
             return
 
-        rl_now = _get_dynamic_rate_limit(config)
+        async def _current_overrides() -> dict:
+            raw = await models.get_setting(db, OVERRIDE_KEY)
+            return normalize_overrides(json.loads(raw)) if raw else {}
+
+        def _effective(ov: dict) -> dict:
+            rl = dict(_get_dynamic_rate_limit(config))
+            rl.update(ov)
+            return rl
+
         if action == "show":
-            await event.reply(_speed_status(rl_now))
+            ov = await _current_overrides()
+            await event.reply(_speed_status(_effective(ov), ov))
             return
 
+        # 覆盖值持久化到数据库（data 目录挂载到宿主机，重启不丢），
+        # 并立即作用到所有 RateLimiter 实例
+        merged = merge_overrides(await _current_overrides(), payload)
+        try:
+            await models.set_setting(db, OVERRIDE_KEY, json.dumps(merged))
+        except Exception as e:
+            await event.reply(f"❌ 保存速度设置失败：{e}")
+            return
+        for rl in _rate_limiters:
+            rl.set_overrides(merged)
+
+        # config.yaml 能写就顺手同步（便于人工查看），只读则忽略
+        cfg_note = ""
         try:
             apply_speed("config.yaml", payload)
-        except OSError as e:
-            await event.reply(f"❌ 写入 config.yaml 失败：{e}")
-            return
+        except OSError:
+            cfg_note = "\nℹ️ config.yaml 为只读，不影响使用：设置已存数据库并立即生效。"
 
         changed = "、".join(payload)
         await event.reply(
             f"✅ 已更新（{changed}），立即生效\n\n"
-            + _speed_status(_get_dynamic_rate_limit(config))
-            + ("\n\n⚠️ config.yaml 若未挂载到宿主机，重建容器后会还原。"))
+            + _speed_status(_effective(merged), merged)
+            + cfg_note)
+
+    @bot.on(events.NewMessage(pattern=r"^/cfg(?:@\w+)?(?=\s|$)"))
+    async def on_cfg(event):
+        """查看/设置配置覆盖值（app_settings 持久化，config.yaml 只读也可用）。"""
+        if not await _require_admin(event):
+            return
+        parts = event.raw_text.split(maxsplit=2)
+        overlay = await async_load_overlay(db)
+
+        if len(parts) == 1:
+            if not overlay:
+                await event.reply(
+                    "🧩 当前没有配置覆盖项（一切以 config.yaml 为准）\n\n"
+                    "用法：\n"
+                    "• /cfg <段.键> <值> — 覆盖某项配置，如 "
+                    "/cfg transfer.strategy_timeout 900\n"
+                    "• /cfg <段.键> reset — 恢复 config.yaml 的值\n"
+                    "• 值支持 YAML 标量语法：数字 / true / [1, 2]\n\n"
+                    "💡 覆盖值存在数据库（data/bot.db），重启不丢；\n"
+                    "   多数配置项在组件启动时读取，重启后完全生效。")
+                return
+            lines = ["🧩 配置覆盖项（优先于 config.yaml，重启不丢）"]
+            lines.extend(f"• {p} = {overlay[p]}" for p in sorted(overlay))
+            lines.append("\n/cfg <段.键> reset 可恢复 config.yaml 的值")
+            await event.reply("\n".join(lines))
+            return
+
+        arg = parts[1].strip()
+        if "." not in arg:
+            await event.reply("路径应为「段.键」，如 transfer.strategy_timeout")
+            return
+        if len(parts) < 3:
+            await event.reply(f"缺少值：/cfg {arg} <值>（或 reset）")
+            return
+
+        value_txt = parts[2].strip()
+        if value_txt.lower() in ("reset", "恢复", "默认"):
+            if arg not in overlay:
+                await event.reply(f"「{arg}」没有覆盖记录，本来就以 config.yaml 为准")
+                return
+            overlay.pop(arg)
+            await async_save_overlay(db, overlay)
+            # 内存 config 同步回退到 config.yaml 磁盘值
+            sec, key = arg.split(".", 1)
+            try:
+                with open("config.yaml", encoding="utf-8") as f:
+                    disk = yaml.safe_load(f) or {}
+                disk_val = (disk.get(sec) or {}).get(key)
+                if isinstance(config.get(sec), dict):
+                    config[sec][key] = disk_val
+            except OSError:
+                pass
+            await event.reply(
+                f"✅ 已移除「{arg}」的覆盖，恢复以 config.yaml 为准（重启不丢）")
+            return
+
+        value = parse_value(value_txt)
+        overlay[arg] = value
+        await async_save_overlay(db, overlay)
+        apply_overlay(config, overlay)
+        await event.reply(
+            f"✅ 已覆盖 {arg} = {value}（已持久化到数据库，重启不丢）\n"
+            "多数配置项在组件启动时读取，重启后完全生效。")
 
     @bot.on(events.NewMessage(pattern=r"^/chapd(?:@\w+)?$"))
     async def on_chapd(event):

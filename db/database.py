@@ -123,6 +123,11 @@ class Database:
                 UNIQUE(task_id, source_msg_id)
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, type);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         await self._migrate()
         await self._ensure_message_map_unique()

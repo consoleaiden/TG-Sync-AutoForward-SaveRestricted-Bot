@@ -108,6 +108,8 @@ python main.py
 | `/retryfail <id\|all>`    | 按失败清单补发（不改动续跑游标），如 `/retryfail 12`、`/retryfail all`   |
 | `/sd`                     | 查看克隆速度阈值；`/sd bot fast\|max\|safe`、`/sd ub fast\|safe` 一键换挡 |
 | `/sd bot 0.3-0.8`         | 自定义 Bot 每条间隔；`/sd ub pause 30 45-90` 自定义 UserBot 长歇节奏      |
+| `/cfg <段.键> <值>`       | 覆盖任意配置项并持久化到数据库（config.yaml 只读也能用），如 `/cfg transfer.strategy_timeout 900` |
+| `/cfg <段.键> reset`      | 移除覆盖，恢复以 config.yaml 为准；`/cfg` 查看全部覆盖项                  |
 | `/chapd`                  | 提示你转发一条频道消息到本群，识别来源频道名 / @用户名 / ID / 链接       |
 | `/chaid`                  | 提示你转发一条频道消息到本群，返回**消息 ID** 和**消息链接**（配 `/kljx`）|
 | `/help`                   | 显示全部命令与功能对照                                                   |

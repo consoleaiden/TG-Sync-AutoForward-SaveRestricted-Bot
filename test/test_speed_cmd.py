@@ -1,15 +1,21 @@
-"""/sd 速度阈值命令：参数解析、config.yaml 手术式写回、命令回显。"""
+"""/sd 速度阈值命令：参数解析、覆盖值持久化、config.yaml 手术式写回、命令回显。"""
 import asyncio
+import json
 import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot.handlers import register_handlers
 from core.monitor import MonitorManager
-from core.speed_config import parse_speed_args, update_rate_limit_text, apply_speed
+from core.rate_limiter import RateLimiter
+from core.speed_config import (
+    OVERRIDE_KEY, merge_overrides, normalize_overrides,
+    parse_speed_args, update_rate_limit_text, apply_speed,
+)
 from db.database import Database
 
 SAMPLE_YAML = """# 主配置
@@ -115,6 +121,44 @@ class ApplySpeedRoundtripTest(unittest.TestCase):
             os.rmdir(tmp)
 
 
+class NormalizeOverridesTest(unittest.TestCase):
+    def test_none_and_dict_passthrough(self):
+        self.assertEqual(normalize_overrides(None), {})
+        self.assertEqual(normalize_overrides({"forward_interval": [1, 2]}),
+                         {"forward_interval": [1, 2]})
+
+    def test_legacy_dict(self):
+        self.assertEqual(normalize_overrides({"a": 1}), {"a": 1})
+
+    def test_name_list_expands_presets(self):
+        ov = normalize_overrides(["fast"])
+        self.assertEqual(ov["forward_interval"], [0.3, 0.8])
+        self.assertEqual(ov["userbot_forward_interval"], [1.5, 3])
+
+    def test_merge(self):
+        merged = merge_overrides({"forward_interval": [1, 2]},
+                                 {"forward_interval": [0.5, 0.5]})
+        self.assertEqual(merged, {"forward_interval": [0.5, 0.5]})
+
+
+class RateLimiterOverrideTest(unittest.IsolatedAsyncioTestCase):
+    async def test_overrides_take_precedence(self):
+        sleeps: list[float] = []
+
+        async def fake_sleep(sec):
+            sleeps.append(sec)
+
+        rl = RateLimiter({"rate_limit": {"forward_interval": [1, 2]}})
+        rl.set_overrides({"forward_interval": [0.1, 0.1],
+                          "batch_pause_every": 2,
+                          "batch_pause_time": [0.3, 0.3]})
+        with unittest.mock.patch("asyncio.sleep", fake_sleep):
+            await rl.wait()
+            await rl.wait()  # 第 2 条触发批次休息
+        self.assertAlmostEqual(sleeps[0], 0.1)
+        self.assertAlmostEqual(sleeps[1], 0.3)
+
+
 class FakeBot:
     def __init__(self):
         self.handlers = []
@@ -178,15 +222,72 @@ class SpeedCommandWiringTest(unittest.IsolatedAsyncioTestCase):
                 ev2 = FakeEvent("/sd bot fast")
                 await fn(ev2)
                 self.assertTrue(ev2.replies[0].startswith("✅ 已更新"), ev2.replies[0])
+                self.assertIn("🟢 在线覆盖生效中", ev2.replies[0])
+                # 覆盖值应持久化到 app_settings
+                from db import models as _models
+                raw = await _models.get_setting(db, OVERRIDE_KEY)
+                ov = normalize_overrides(json.loads(raw))
+                self.assertEqual(ov.get("forward_interval"), [0.3, 0.8])
+                self.assertEqual(ov.get("batch_pause_every"), 100)
+                # config.yaml 可写时应被顺手同步
                 with open("config.yaml", encoding="utf-8") as f:
                     written = f.read()
                 self.assertIn("forward_interval: [0.3, 0.8]", written)
                 self.assertIn("batch_pause_every: 100", written)
-                # 热读取应立即拿到新值
-                from core.rate_limiter import _get_dynamic_rate_limit
-                rl = _get_dynamic_rate_limit(config)
-                self.assertEqual(rl.get("forward_interval"), [0.3, 0.8])
+                # 再次 /sd 显示的是生效值（config + 覆盖）
+                ev3 = FakeEvent("/sd")
+                await fn(ev3)
+                self.assertIn("每条间隔 0.3~0.8 秒", ev3.replies[0])
             finally:
+                await db.close()
+        finally:
+            os.chdir(old_cwd)
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def test_sd_works_with_readonly_config(self):
+        """config.yaml 只读（容器常见挂载方式）时 /sd 仍必须可用。"""
+        tmp = tempfile.mkdtemp()
+        old_cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            cfg = os.path.join(tmp, "config.yaml")
+            with open(cfg, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_YAML)
+            os.chmod(cfg, 0o444)  # 只读
+            db = Database(os.path.join(tmp, "sd3.db"))
+            await db.init()
+            bot = FakeBot()
+            config = {"admin_ids": [7], "rate_limit": {}}
+            monitor = MonitorManager(bot, bot, db, config)
+            register_handlers(bot, bot, db, config, monitor)
+            try:
+                fn = self._find_speed_handler(bot)
+                ev = FakeEvent("/sd bot fast")
+                await fn(ev)
+                self.assertTrue(ev.replies[0].startswith("✅ 已更新"), ev.replies[0])
+                self.assertIn("只读", ev.replies[0], "应提示 config.yaml 只读但不影响")
+
+                # 覆盖值已入库，且重启后 _load_speed_overrides 能恢复
+                from db import models as _models
+                raw = await _models.get_setting(db, OVERRIDE_KEY)
+                self.assertIsNotNone(raw)
+                ov = normalize_overrides(json.loads(raw))
+                self.assertEqual(ov.get("forward_interval"), [0.3, 0.8])
+
+                # RateLimiter 拿到覆盖值后行为符合预期
+                rl = RateLimiter(config)
+                rl.set_overrides(ov)
+                sleeps: list[float] = []
+
+                async def fake_sleep(sec):
+                    sleeps.append(sec)
+                with unittest.mock.patch("asyncio.sleep", fake_sleep):
+                    await rl.wait()
+                self.assertGreaterEqual(sleeps[0], 0.3)
+                self.assertLessEqual(sleeps[0], 0.8)
+            finally:
+                os.chmod(cfg, 0o644)
                 await db.close()
         finally:
             os.chdir(old_cwd)

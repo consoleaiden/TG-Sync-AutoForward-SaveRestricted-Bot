@@ -9,6 +9,7 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault
 
 from db.database import Database
 from bot.handlers import register_handlers
+from core.config_store import apply_overlay, async_load_overlay
 from core.monitor import MonitorManager
 from core.storage import (
     audit_db_path,
@@ -225,6 +226,7 @@ async def _setup_bot(bot: TelegramClient, userbot_manager: UserBotManager,
             BotCommand(command="klfail", description="查看克隆失败的条目"),
             BotCommand(command="retryfail", description="一键补发失败条目"),
             BotCommand(command="sd", description="查看/设置克隆速度阈值"),
+            BotCommand(command="cfg", description="查看/覆盖配置项（存数据库）"),
             BotCommand(command="chapd", description="转发消息识别来源频道"),
             BotCommand(command="chaid", description="转发消息获取消息ID和链接"),
             BotCommand(command="help", description="全部命令与功能说明"),
@@ -303,6 +305,13 @@ async def main():
     await db.init()
     storage_audit = audit_db_path(db_path, config=config)
     logger.info("数据库初始化完成 · %s", format_audit(storage_audit))
+
+    # 应用数据库配置覆盖层（/cfg 在线调整过的项），必须在组件构造前合并
+    overlay = await async_load_overlay(db)
+    if overlay:
+        apply_overlay(config, overlay)
+        logger.info("已从数据库恢复 %d 项配置覆盖: %s",
+                    len(overlay), ", ".join(sorted(overlay)))
     warning = persistence_warning(storage_audit, db_path)
     if warning:
         logger.warning("%s", warning)

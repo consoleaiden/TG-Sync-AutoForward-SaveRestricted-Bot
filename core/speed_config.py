@@ -48,6 +48,37 @@ PRESETS = {
 _INTERVAL_RE = re.compile(r"^(\d+(?:\.\d+)?)(?:\s*[-~]\s*(\d+(?:\.\d+)?))?$")
 _PAUSE_RE = re.compile(r"^(\d{1,5})\s+(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)$")
 
+# /sd 覆盖值在 app_settings 表里的键（JSON 数组格式存储，兼容旧版「{键: 值}」）
+OVERRIDE_KEY = "rate_limit_overrides"
+
+
+def normalize_overrides(raw) -> dict:
+    """把存储层取出的覆盖值规范化为 {config键: 新值}。
+
+    历史版本存的是 dict；现行版本存 [键1, 键2, ...]，值从 PRESETS 反查，
+    避免在数据库里重复维护档位数值。
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, list):
+        merged: dict = {}
+        for name in raw:
+            for target_presets in PRESETS.values():
+                preset = target_presets.get(str(name).lower())
+                if preset:
+                    merged.update(preset)
+        return merged
+    return {}
+
+
+def merge_overrides(old: dict, updates: dict) -> dict:
+    """合并覆盖值；同名键以新值为准（部分覆盖是合法状态，不做档位联想）。"""
+    merged = dict(old)
+    merged.update(updates)
+    return merged
+
 
 def _fmt(value) -> str:
     if isinstance(value, list):

@@ -29,19 +29,28 @@ class RateLimiter:
         self._userbot_count = 0
         self._interval_scale = 1.0  # FloodWait 后翻倍
         self._lock = asyncio.Lock()
+        # /sd 命令写入的在线覆盖值（优先级高于 config.yaml），多实例间共享
+        self.overrides: dict = {}
 
     def _current_limits(self) -> dict:
         """读取最新限流配置（支持运行时热更新 config.yaml）。"""
         return _get_dynamic_rate_limit(self.fallback_config)
+
+    def set_overrides(self, overrides: dict) -> None:
+        """设置在线覆盖值（来自 /sd，持久化在数据库里）。"""
+        self.overrides = dict(overrides)
 
     async def wait(self, kind: str = "default"):
         """每次转发前调用，自动控制速率。
 
         kind="userbot" 时使用更保守的 UserBot 节奏（`userbot_forward_*`），
         用于「UserBot 直接转发」这条策略，降低用户账号被限流的概率。
+        优先级：/sd 覆盖值 > config.yaml > 代码默认值。
         """
         async with self._lock:
             rl = self._current_limits()
+            if self.overrides:
+                rl = {**rl, **self.overrides}
             self.flood_wait_multiplier = rl.get("flood_wait_multiplier", self.flood_wait_multiplier)
             self.max_flood_wait = rl.get("max_flood_wait", self.max_flood_wait)
 

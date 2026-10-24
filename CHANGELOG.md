@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed（/sd 在只读 config.yaml 环境不可用）
+- **速度覆盖值改为持久化到数据库**（`app_settings` 表，键 `rate_limit_overrides`）：
+  容器内 config.yaml 为只读挂载时，`/sd` 不再报 `Errno 30`；写入后立即作用到
+  所有 RateLimiter 实例，重启自动恢复。config.yaml 能写时仍顺手同步（便于人工查看）。
+
+### Added（通用配置覆盖层 /cfg）
+- **`app_settings` 表**：通用 KV 存储（`data/bot.db` 挂载宿主机，重启不丢）。
+- **`/cfg` 命令**：`/cfg <段.键> <值>` 覆盖任意配置项（值支持 YAML 标量语法）、
+  `/cfg <段.键> reset` 恢复 config.yaml 值、`/cfg` 列出全部覆盖项。
+  启动时在组件构造前深合并进内存 config（优先级：覆盖值 > config.yaml > 默认值），
+  运行中设置对启动时读取的配置项在重启后完全生效。
+- 新增 `core/config_store.py`、`test/test_config_store.py`（11 例）。
+
 ### Added（在线调速：/sd 命令）
 - **`/sd` 速度阈值命令**：分别给 Bot 与 UserBot 设置转发节奏，写入 `config.yaml`
   的 `rate_limit` 段，`RateLimiter` 热读取、立即生效、无需重启。
