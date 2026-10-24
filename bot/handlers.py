@@ -7,6 +7,7 @@
 import asyncio
 import html
 import logging
+import os
 import re
 import time
 
@@ -42,6 +43,7 @@ from core.syncer import Syncer
 from core.restricted_syncer import RestrictedSyncer
 from core.monitor import MonitorManager
 from core.rate_limiter import _get_dynamic_rate_limit
+from core.speed_config import apply_speed, parse_speed_args
 from core.userbot_manager import UserBotManager
 from db.database import Database
 from db import models
@@ -1689,6 +1691,61 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if total_fail:
             text.append("仍失败的条目通常是源消息已删除、超出体积上限或仍被限制。")
         await event.reply("\n".join(text))
+
+    def _speed_status(rl: dict) -> str:
+        def rng(v) -> str:
+            if isinstance(v, list):
+                return f"{v[0]}~{v[1]} 秒"
+            return f"{v} 秒"
+        bi = rl.get("forward_interval", [1, 2])
+        be = rl.get("batch_pause_every", 50)
+        bt = rl.get("batch_pause_time", [30, 60])
+        ui = rl.get("userbot_forward_interval", [3, 6])
+        ue = rl.get("userbot_forward_pause_every", 25)
+        ut = rl.get("userbot_forward_pause_time", [60, 120])
+        return (
+            "⚙️ 当前克隆速度阈值（改动立即生效，无需重启）\n"
+            f"【Bot】每条间隔 {rng(bi)} · 每 {be} 条歇 {rng(bt)}\n"
+            f"【UserBot】每条间隔 {rng(ui)} · 每 {ue} 条歇 {rng(ut)}\n\n"
+            "用法：\n"
+            "• /sd bot fast — Bot 提速（0.3~0.8s/条，每 100 条歇 20~40s）\n"
+            "• /sd bot max — Bot 全速（基本不等待，易触发 FloodWait，慎用）\n"
+            "• /sd bot safe — 恢复默认\n"
+            "• /sd bot 0.5 或 /sd bot 0.3-0.8 — 自定义每条间隔\n"
+            "• /sd bot pause 100 20-40 — 每 100 条歇 20~40 秒\n"
+            "• /sd ub fast / safe / 3-6 / pause 25 60-120 — 同上，作用于 UserBot\n\n"
+            "💡 Bot 走官方服务端转发、阈值较高，fast 档一般很安全；\n"
+            "   UserBot 是用户账号，建议别低于 1.5s/条——被风控的代价比慢高得多。"
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/sd(?:@\w+)?(?=\s|$)"))
+    async def on_speed(event):
+        """查看/设置克隆转发速度阈值（写入 config.yaml，RateLimiter 热读取）。"""
+        if not await _require_admin(event):
+            return
+        rest = event.raw_text.split(maxsplit=1)
+        arg = rest[1].strip() if len(rest) > 1 else ""
+        action, payload = parse_speed_args(arg)
+        if action == "error":
+            await event.reply(payload)
+            return
+
+        rl_now = _get_dynamic_rate_limit(config)
+        if action == "show":
+            await event.reply(_speed_status(rl_now))
+            return
+
+        try:
+            apply_speed("config.yaml", payload)
+        except OSError as e:
+            await event.reply(f"❌ 写入 config.yaml 失败：{e}")
+            return
+
+        changed = "、".join(payload)
+        await event.reply(
+            f"✅ 已更新（{changed}），立即生效\n\n"
+            + _speed_status(_get_dynamic_rate_limit(config))
+            + ("\n\n⚠️ config.yaml 若未挂载到宿主机，重建容器后会还原。"))
 
     @bot.on(events.NewMessage(pattern=r"^/chapd(?:@\w+)?$"))
     async def on_chapd(event):

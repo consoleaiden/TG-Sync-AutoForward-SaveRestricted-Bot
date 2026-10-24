@@ -13,6 +13,7 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 - **Live Progress** — Progress bar, percentage, speed and ETA, refreshed in place on a single message
 - **Integrity Report** — Every finished clone reports `source N / mapped M / coverage X% / gap K`, so an archive run tells you at a glance whether it got everything
 - **Retry Failed Items** — `/klfail` lists what failed and why; `/retryfail <id|all>` re-sends them without touching the resume cursor
+- **Adjustable Speed** — `/sd` command tunes forwarding pace for Bot and UserBot separately (presets or custom ranges), effective immediately without restart
 - **Resumable** — Pause, crash or restart and it continues from the saved cursor with no duplicates or gaps
 - **Idempotent** — A `UNIQUE(task_id, source_msg_id)` index on `message_map` plus a pre-send lookup means re-runs never duplicate messages in the target
 - **Stall Recovery** — Per-strategy timeout (1200s) stops a dead connection from freezing the task; an independent watchdog alerts you after 10 minutes without progress
@@ -103,6 +104,8 @@ python main.py
 | `/jtlb`                        | Monitor task list (includes follow-ups created from clone tasks)                  |
 | `/klfail`                      | Show tasks with failures; `/klfail 12` lists task #12's failed items and reasons  |
 | `/retryfail <id\|all>`         | Re-send failed items (keeps the resume cursor untouched)                          |
+| `/sd`                          | View clone speed thresholds; `/sd bot fast\|max\|safe`, `/sd ub fast\|safe` presets |
+| `/sd bot 0.3-0.8`              | Custom per-message delay; `/sd ub pause 30 45-90` custom UserBot batch pause        |
 | `/chapd`                       | Prompts you to forward a channel message here to identify title / @username / ID  |
 | `/chaid`                       | Prompts you to forward a channel message here to get its **ID** and **link**      |
 | `/help`                        | Show every command with its purpose                                               |

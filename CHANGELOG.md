@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added（在线调速：/sd 命令）
+- **`/sd` 速度阈值命令**：分别给 Bot 与 UserBot 设置转发节奏，写入 `config.yaml`
+  的 `rate_limit` 段，`RateLimiter` 热读取、立即生效、无需重启。
+  - 档位：`/sd bot fast`（0.3~0.8s/条）、`/sd bot max`（全速，慎用）、
+    `/sd bot safe`；`/sd ub fast`（1.5~3s/条）、`/sd ub safe`。
+  - 自定义：`/sd bot 0.5`、`/sd bot 0.3-0.8`、`/sd bot pause 100 20-40`、
+    `/sd ub 3-6`、`/sd ub pause 25 60-120`。
+  - 写回采用手术式文本替换，保留 config.yaml 里的注释与排版；缺键自动补入。
+- 新增 `core/speed_config.py`（解析 + 写回）与 `test/test_speed_cmd.py`（14 例）。
+
 ### Added（长任务稳定性：卡死自愈 / 完整性校验 / 失败补发）
 - **单条策略超时**（`transfer.strategy_timeout`，默认 1200s，0=不限）：策略调用统一走
   `_call_with_timeout`，半开连接或 TCP 假死时不再让整个任务停在同一游标上，超时即降级。

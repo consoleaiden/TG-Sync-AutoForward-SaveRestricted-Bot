@@ -244,6 +244,29 @@ UserBot 走的是**用户账号**，被限流/限制的代价远高于 Bot（Bot
 4. **想更保守**：`userbot_forward_interval: [8, 15]`、`userbot_forward_pause_every: 15`；
 5. **完全不想动 UserBot**：`transfer.userbot_forward: false`，退回②b（Bot 发帖）→ ③。
 
+### 在线调速度：/sd 命令
+
+不用改配置文件，直接发命令分别调 Bot / UserBot 的节奏，**立即生效**（`RateLimiter`
+每次转发前都重读 `config.yaml`，`/sd` 就是把新值写回去）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/sd` | 查看当前两套阈值 |
+| `/sd bot fast` | Bot 提速：每条 0.3~0.8s，每 100 条歇 20~40s |
+| `/sd bot max` | Bot 全速：基本不等待，仅留兜底长歇（易触发 FloodWait，慎用） |
+| `/sd bot safe` | 恢复默认（1~2s，每 50 条歇 30~60s） |
+| `/sd bot 0.5` / `/sd bot 0.3-0.8` | 自定义 Bot 每条间隔 |
+| `/sd bot pause 100 20-40` | 自定义 Bot 每 100 条歇 20~40 秒 |
+| `/sd ub fast` / `/sd ub safe` | UserBot 提速（1.5~3s，每 30 条歇 45~90s）/ 恢复默认 |
+| `/sd ub 3-6` / `/sd ub pause 25 60-120` | 自定义 UserBot 间隔与长歇 |
+
+**阈值怎么定**：Bot 走官方服务端转发（`forward_messages`），Telegram 对这类请求
+的容忍度高，`fast` 档基本无感，`max` 档才会开始撞 FloodWait；UserBot 是用户账号，
+建议**不要低于 1.5s/条**，且长歇间隔别拉太大——「长时间匀速大批量搬运」本身就是
+最容易被风控识别的行为特征，宁慢勿封。
+
+注意：`/sd` 写的是容器内的 `config.yaml`，若该文件没有挂载到宿主机，重建容器后会还原。
+
 **适用条件（第②层能命中的前提）**：
 
 - UserBot 是源频道的成员（能读）；

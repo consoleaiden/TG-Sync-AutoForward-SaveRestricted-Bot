@@ -687,7 +687,8 @@ class MenuController:
                 "💾 数据存储\n"
                 f"• {format_audit(audit)}\n"
                 f"• {store_state}\n\n"
-                "修改 config.yaml 后立即生效，无需重启。"
+                "修改 config.yaml 后立即生效，无需重启。\n"
+                "⚡ 也可直接用 /sd 命令在线调速度阈值（bot / ub 分别设置）。"
             )
             await event.edit(text, buttons=[[Button.inline("« 主菜单", data="m:home")]])
             return
@@ -706,6 +707,11 @@ class MenuController:
                 "/jtlb — 监听任务列表\n"
                 "/klfail — 查看失败条目（带任务 ID 看明细）\n"
                 "/retryfail <任务id|all> — 一键补发失败条目\n\n"
+                "【速度】\n"
+                "/sd — 查看克隆速度阈值\n"
+                "/sd bot fast — Bot 提速；/sd bot max 全速；/sd bot safe 恢复默认\n"
+                "/sd ub fast / safe — UserBot 档位\n"
+                "/sd bot 0.3-0.8 / pause 100 20-40 — 自定义间隔与长歇\n\n"
                 "【工具】\n"
                 "/chapd — 转发一条频道消息，识别来源频道\n"
                 "/chaid — 转发一条频道消息，返回消息 ID 和链接（配 /kljx 用）\n"

@@ -19,6 +19,7 @@ admin_ids:
 
 # 限流配置
 rate_limit:
+  # ⚡ 以上阈值也可用 /sd 命令在线调整（bot / ub 分别设置），改完立即生效无需重启
   batch_size: 100 # 每批获取消息数
   forward_interval: [1, 2] # 每条转发间隔范围（秒）
   batch_pause_every: 50 # 每转发N条后休息
