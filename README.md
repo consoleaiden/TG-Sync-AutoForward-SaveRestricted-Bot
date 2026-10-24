@@ -110,6 +110,7 @@ python main.py
 | `/sd bot 0.3-0.8`         | 自定义 Bot 每条间隔；`/sd ub pause 30 45-90` 自定义 UserBot 长歇节奏      |
 | `/cfg <段.键> <值>`       | 覆盖任意配置项并持久化到数据库（config.yaml 只读也能用），如 `/cfg transfer.strategy_timeout 900` |
 | `/cfg <段.键> reset`      | 移除覆盖，恢复以 config.yaml 为准；`/cfg` 查看全部覆盖项                  |
+| `/bf`                     | 查看克隆并发状态；`/bf 2` 设置同时克隆上限（1~10，立即生效、重启不丢）    |
 | `/chapd`                  | 提示你转发一条频道消息到本群，识别来源频道名 / @用户名 / ID / 链接       |
 | `/chaid`                  | 提示你转发一条频道消息到本群，返回**消息 ID** 和**消息链接**（配 `/kljx`）|
 | `/help`                   | 显示全部命令与功能对照                                                   |

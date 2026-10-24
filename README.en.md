@@ -108,6 +108,7 @@ python main.py
 | `/sd bot 0.3-0.8`              | Custom per-message delay; `/sd ub pause 30 45-90` custom UserBot batch pause        |
 | `/cfg <section.key> <value>`   | Override any config item and persist it to the database (works with read-only config.yaml) |
 | `/cfg <section.key> reset`     | Remove an override; `/cfg` lists all active overrides                                |
+| `/bf`                          | View clone concurrency; `/bf 2` sets the max parallel clone limit (1~10)             |
 | `/chapd`                       | Prompts you to forward a channel message here to identify title / @username / ID  |
 | `/chaid`                       | Prompts you to forward a channel message here to get its **ID** and **link**      |
 | `/help`                        | Show every command with its purpose                                               |

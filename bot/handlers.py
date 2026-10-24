@@ -42,6 +42,7 @@ from core.message_logic import (
     is_file_media,
 )
 from core.base_component import SyncComponentBase
+from core.clone_gate import CloneGate
 from core.syncer import Syncer
 from core.restricted_syncer import RestrictedSyncer
 from core.monitor import MonitorManager
@@ -254,9 +255,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     _sync_tasks: dict[int, asyncio.Task] = {}
     # 克隆并发闸门：默认同时只跑 1 个克隆任务。
     # 每个 Syncer 自带一个 RateLimiter，同时跑 N 个时实际频率就是设计值 × N，
-    # FloodWait 会成倍到来——排队比并行更安全。
+    # FloodWait 会成倍到来——用 /bf 调大前请想清楚风控代价。
     max_concurrent = max(1, int((config.get("clone") or {}).get("max_concurrent", 1)))
-    _clone_gate = asyncio.Semaphore(max_concurrent)
+    _clone_gate = CloneGate(max_concurrent)
     # /sd 覆盖值要同时作用到所有 RateLimiter 实例（每个组件各持一个）
     _rate_limiters = [monitor_manager.rl, syncer.rl, restricted_syncer.rl]
 
@@ -585,14 +586,14 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                     userbot: TelegramClient | None) -> None:
         async def _runner() -> None:
             # 排队提示只在前方确实有任务时发一次，避免续传时刷屏
-            if _clone_gate.locked():
+            if _clone_gate.full:
                 logger.info("克隆并发已达上限 %d，任务 #%d 排队等待",
-                            max_concurrent, task_id)
+                            _clone_gate.limit, task_id)
                 try:
                     await bot.send_message(
                         notify_chat_id or target_chat_id,
-                        f"⏳ 任务 #{task_id} 已排队：当前已有 {max_concurrent} 个克隆在跑，"
-                        f"前面的跑完会自动开始（不建议同时跑多个，限流会成倍到来）",
+                        f"⏳ 任务 #{task_id} 已排队：当前已有 {_clone_gate.limit} 个克隆在跑，"
+                        f"前面的跑完会自动开始（/bf 可调并发，但同时跑多个限流会成倍到来）",
                         reply_to=target_topic_id or None)
                 except Exception as e:
                     logger.debug("发送排队提示失败: %s", e)
@@ -1697,7 +1698,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         await event.reply(
             f"🔁 开始补发 {len(targets)} 个任务的失败条目…"
-            + ("\n⏳ 已有克隆在跑，等它跑完自动开始" if _clone_gate.locked() else ""))
+            + ("\n⏳ 已有克隆在跑，等它跑完自动开始" if _clone_gate.full else ""))
 
         total_ok = total_fail = 0
         details: list[str] = []
@@ -1863,6 +1864,65 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         await event.reply(
             f"✅ 已覆盖 {arg} = {value}（已持久化到数据库，重启不丢）\n"
             "多数配置项在组件启动时读取，重启后完全生效。")
+
+    @bot.on(events.NewMessage(pattern=r"^/bf(?:@\w+)?(?=\s|$)"))
+    async def on_clone_gate(event):
+        """查看/设置克隆并发数：/bf 查看，/bf 2 设置（立即生效，重启不丢）。"""
+        if not await _require_admin(event):
+            return
+        parts = event.raw_text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        def _status() -> str:
+            state = "🟢 空闲" if _clone_gate.active == 0 else (
+                f"🏃 {min(_clone_gate.active, _clone_gate.limit)} 个在跑"
+                + (f" · {_clone_gate.active - _clone_gate.limit} 个排队"
+                   if _clone_gate.active > _clone_gate.limit else ""))
+            return (
+                "🚦 克隆并发设置\n"
+                f"• 同时克隆上限: {_clone_gate.limit}\n"
+                f"• 当前状态: {state}\n\n"
+                "用法：/bf <数量>（1~10），如 /bf 2\n\n"
+                "⚠️ 并发调大 = 请求频率成倍叠加：Bot 侧多表现为 FloodWait 变慢，\n"
+                "   UserBot 侧则直接放大风控风险（所有任务共用同一个用户账号）。\n"
+                "   建议保持 1 个，确有需要再用 2；配合 /sd ub safe 更稳。")
+
+        if not arg:
+            await event.reply(_status())
+            return
+
+        if not arg.isdigit():
+            await event.reply("并发数量应为 1~10 的整数，如 /bf 2")
+            return
+        n = int(arg)
+        if not 1 <= n <= 10:
+            await event.reply("并发数量范围是 1~10。对个人使用来说，超过 2 "
+                              "基本只有风控风险没有速度收益。")
+            return
+
+        old = _clone_gate.limit
+        await _clone_gate.set_limit(n)
+        # 持久化：走通用配置覆盖层，重启不丢
+        try:
+            overlay = await async_load_overlay(db)
+            overlay["clone.max_concurrent"] = n
+            await async_save_overlay(db, overlay)
+            clone_cfg = config.setdefault("clone", {})
+            if isinstance(clone_cfg, dict):
+                clone_cfg["max_concurrent"] = n
+        except Exception as e:
+            await event.reply(
+                f"✅ 并发上限已调整为 {n}（本次运行生效），"
+                f"但持久化失败：{e}")
+            return
+
+        tip = ""
+        if n > old:
+            tip = f"\nℹ️ 已从 {old} 调大：排队中的任务会自动开始。"
+        elif n < old:
+            tip = "\nℹ️ 已调小：正在跑的任务不受影响，多余的排队等待释放。"
+        await event.reply(f"✅ 克隆并发上限 {old} → {n}，立即生效、重启不丢\n" + tip
+                          + "\n\n" + _status())
 
     @bot.on(events.NewMessage(pattern=r"^/chapd(?:@\w+)?$"))
     async def on_chapd(event):

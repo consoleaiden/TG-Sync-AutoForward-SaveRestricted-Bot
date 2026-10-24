@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added（/bf 克隆并发命令）
+- **`/bf` 命令**：`/bf` 查看当前并发与排队状态，`/bf 2`（1~10）在线调整同时
+  克隆上限——立即生效（排队中的任务自动开始）、持久化到数据库重启不丢。
+- **`CloneGate`**（core/clone_gate.py）：替代固定上限的 `asyncio.Semaphore`，
+  支持运行中调大（唤醒排队任务）/调小（不中断在跑任务，只拦新的）。
+- 提速取舍说明写进命令回显：并发调大 = 请求频率成倍叠加，Bot 侧多为 FloodWait
+  变慢，UserBot 侧直接放大风控风险；超过 2 基本只有风险没有速度收益。
+- 新增 `test/test_bf_cmd.py`（5 例），全量 215 例通过。
+
 ### Fixed（/sd 在只读 config.yaml 环境不可用）
 - **速度覆盖值改为持久化到数据库**（`app_settings` 表，键 `rate_limit_overrides`）：
   容器内 config.yaml 为只读挂载时，`/sd` 不再报 `Errno 30`；写入后立即作用到
