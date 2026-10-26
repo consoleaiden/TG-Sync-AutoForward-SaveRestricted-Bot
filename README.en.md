@@ -109,6 +109,8 @@ python main.py
 | `/cfg <section.key> <value>`   | Override any config item and persist it to the database (works with read-only config.yaml) |
 | `/cfg <section.key> reset`     | Remove an override; `/cfg` lists all active overrides                                |
 | `/bf`                          | View clone concurrency; `/bf 2` sets the max parallel clone limit (1~10)             |
+| `/speedtop`                    | Benchmark the top-40 proxy list locally and auto-apply the fastest one               |
+| `/speedall`                    | Benchmark the full proxy list (~1000 entries) with live progress; same auto-apply    |
 | `/chapd`                       | Prompts you to forward a channel message here to identify title / @username / ID  |
 | `/chaid`                       | Prompts you to forward a channel message here to get its **ID** and **link**      |
 | `/help`                        | Show every command with its purpose                                               |

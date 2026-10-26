@@ -1865,6 +1865,92 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             f"✅ 已覆盖 {arg} = {value}（已持久化到数据库，重启不丢）\n"
             "多数配置项在组件启动时读取，重启后完全生效。")
 
+    # ── 代理测速命令：/speedall（全量榜） / /speedtop（前 40 名）──────────
+    _speedtest_busy = False
+
+    async def _run_proxy_speedtest(event, kind: str) -> None:
+        """拉取榜单 → 本机测速 → 选优写状态 → 自动重启应用。"""
+        nonlocal _speedtest_busy
+        if not await _require_admin(event):
+            return
+        if _speedtest_busy:
+            await event.reply("⏳ 已有一轮测速在进行中，等它结束后再试")
+            return
+
+        proxy_cfg = config.get("proxy") or {}
+        if proxy_cfg.get("mode") == "off":
+            await event.reply(
+                "当前 proxy.mode=off（直连），测速结果不会生效。\n"
+                "如需使用，请先把 config.yaml 中 proxy.mode 改为 auto。")
+            return
+        if not (proxy_cfg.get("sources") or []) and proxy_cfg.get("mode") != "auto":
+            await event.reply(
+                f"当前 proxy.mode={proxy_cfg.get('mode') or 'auto'}，"
+                "测速结果仍会写入状态文件，但只有 auto 模式重启后才会使用它。")
+
+        kind_label = "全量榜" if kind == "all" else "前 40 名"
+        _speedtest_busy = True
+        progress_msg = await event.reply(
+            f"🚀 开始测速（{kind_label}）…\n拉取榜单中，测速完成后自动选用最快的代理")
+        try:
+            async def _progress(done: int, total: int, alive: int) -> None:
+                try:
+                    await progress_msg.edit(
+                        f"🚀 测速中（{kind_label}）…\n"
+                        f"进度: {done}/{total} · 存活 {alive}")
+                except Exception:
+                    pass  # 编辑失败（限流/内容未变）不影响测速本身
+
+            from core.proxy_speedtest import run_speed_test
+            rep = await run_speed_test(kind, proxy_cfg, progress_cb=_progress)
+        except RuntimeError as e:
+            await event.reply(f"❌ 测速失败：{e}")
+            return
+        except Exception as e:
+            logger.exception("代理测速异常 kind=%s", kind)
+            await event.reply(f"❌ 测速异常：{type(e).__name__}: {e}")
+            return
+        finally:
+            _speedtest_busy = False
+
+        best = rep["best"]
+        mins = int(rep["elapsed"] // 60)
+        secs = rep["elapsed"] % 60
+        top_lines = []
+        for i, c in enumerate(
+                [x for x in rep["ranked"] if x.get("dc_ok")][:5], 1):
+            top_lines.append(
+                f"{i}. {c['server']}:{c['port']} · DC {c['dc_ms']}ms · 握手 "
+                f"{c['latency_ms']}ms")
+        text = (
+            f"🏁 测速完成（{kind_label}）\n"
+            f"• 共测 {rep['total']:,} 条 · 存活 {rep['alive']:,} · "
+            f"超时/不可用 {rep['failed']:,}\n"
+            f"• 用时 {mins}分{secs:.0f}秒\n"
+            f"🥇 最优: {best['server']}:{best['port']}"
+            f"（握手 {best['latency_ms']}ms · DC 往返 {best.get('dc_ms') or '—'}ms）")
+        if top_lines:
+            text += "\nTop5:\n" + "\n".join(top_lines)
+        text += f"\n✅ 已写入 {rep['state_file']}，设为当前使用的代理"
+
+        if _sync_tasks:
+            await event.reply(
+                text + "\n\n⚠️ 当前有克隆任务在跑，为免中断未自动重启。\n"
+                       "任务结束后重启容器即按新代理连接。")
+            return
+        await event.reply(text + "\n🔄 10 秒后自动重启进程以应用新代理…")
+        async def _apply_restart() -> None:
+            await asyncio.sleep(10)
+            logger.info("测速选优完成，重启进程应用新代理")
+            os._exit(0)
+        asyncio.create_task(_apply_restart())
+
+    @bot.on(events.NewMessage(pattern=r"^/(speedall|speedtop)(?:@\w+)?(?=\s|$)"))
+    async def on_proxy_speedtest(event):
+        """对代理榜单做本机测速并自动选用最快的代理。"""
+        kind = "all" if event.pattern_match.group(1) == "speedall" else "top40"
+        await _run_proxy_speedtest(event, kind)
+
     @bot.on(events.NewMessage(pattern=r"^/bf(?:@\w+)?(?=\s|$)"))
     async def on_clone_gate(event):
         """查看/设置克隆并发数：/bf 查看，/bf 2 设置（立即生效，重启不丢）。"""

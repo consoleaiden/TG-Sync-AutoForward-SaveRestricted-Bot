@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added（代理测速命令：/speedall、/speedtop）
+- 新增 `core/proxy_speedtest.py`：拉取 telegram-mtproto-proxy-list 榜单
+  （proxies.json 数组格式 / top40.json 字典格式，自动去重）→ 并发 FakeTLS
+  握手测速（单台超时/异常只计失败不中断）→ DC 往返校验 → 选优写入
+  data/proxy.json（与启动选优同一机制）。
+- 新增命令 `/speedtop`（前 40 名）与 `/speedall`（全量约 1000 条，带进度编辑）：
+  测速完成自动把最优代理设为当前使用，无运行中任务时 10 秒后自动重启进程生效，
+  有任务在跑则提示稍后手动重启；`proxy.mode=off` 时拒绝执行并说明。
+- 全部代理不可用时报错并保持旧代理不变；防重入（测速进行中拒绝新请求）。
+
 ### Fixed（克隆完成但任务列表进度不足 100%）
 - 进度口径统一为「已处理 = 成功 + 失败 + 跳过」：此前进度条只画成功数，
   而总数包含服务消息与被去重跳过的条目，任务跑完也永远到不了 100%。
