@@ -40,9 +40,12 @@ logger = logging.getLogger("tg_forward_bot")
 
 # ---------------------------------------------------------------------------
 # 重连策略常量
+# 短退避起步（5s 翻倍封顶 30min）：代理中途失效时 Telethon 内部重连
+# （10×5s）先失败，应用层随即短间隔重连并触发代理重选，自愈目标 < 3 分钟，
+# 不再是旧版"固定 30 分钟一试、第 3 次失败才重选 + 重启"的 90 分钟停机。
 # ---------------------------------------------------------------------------
-MAX_RECONNECT_ATTEMPTS = 20      # 应用层最多重连次数 (20 × 30min = 10h)
-RECONNECT_BASE_DELAY = 1800      # 重连间隔 (秒) = 30 分钟
+MAX_RECONNECT_ATTEMPTS = 20      # 应用层最多重连次数（兜底上限，正常到不了）
+RECONNECT_BASE_DELAY = 5         # 重连起始间隔（秒），按 2^n 翻倍
 RECONNECT_MAX_DELAY = 1800       # 最大间隔 (秒) = 30 分钟
 
 
@@ -140,11 +143,13 @@ async def _resolve_proxy(config: dict) -> tuple | None:
     return build_telethon_proxy(state_to_candidate(state))
 
 
-async def _proxy_refresher(config: dict, current: dict | None) -> None:
-    """每小时复测一次代理榜单，代理失效或明显更优时重启进程切换。"""
+async def _proxy_refresher(config: dict, holder: dict) -> None:
+    """每小时复测一次代理榜单，代理失效或明显更优时热切换（不重启进程）。"""
     cfg = normalize_config(config.get("proxy"))
     interval = max(5, int(cfg.get("refresh_minutes", 60))) * 60
     ratio = float(cfg.get("switch_improve_ratio", 0.7))
+    bot = holder["bot"]
+    userbot_manager = holder["userbot_manager"]
 
     while True:
         await asyncio.sleep(interval)
@@ -156,15 +161,19 @@ async def _proxy_refresher(config: dict, current: dict | None) -> None:
         if not state:
             continue
 
-        # 每轮从状态文件读当前代理：/speedall /speedtop 的热切换只更新
-        # 状态文件与活客户端，不重启进程，用启动时捕获的旧值会误判"已变更"
-        current = state_to_candidate(load_state(cfg["state_file"])) or current
-
         new_best = state_to_candidate(state)
+        if new_best is None:
+            continue
+        # 以运行中记录为准，回退到状态文件（热切换命令只更新后者）
+        current = holder.get("candidate") or state_to_candidate(
+            load_state(cfg["state_file"]))
+
         if current is None:
-            logger.warning("已选出可用代理 %s:%d，重启进程以应用",
+            logger.warning("已选出可用代理 %s:%d，热切换应用",
                            new_best["server"], new_best["port"])
-            os._exit(0)
+            if await _hotswap_all(bot, userbot_manager, new_best):
+                holder["candidate"] = new_best
+            continue
 
         if _candidate_key(new_best) == _candidate_key(current):
             logger.info("代理复测完成，当前代理仍是最优，无需切换")
@@ -191,19 +200,26 @@ async def _proxy_refresher(config: dict, current: dict | None) -> None:
                         int((1 - ratio) * 100))
             continue
 
-        logger.warning("%s，切换到 %s:%d，重启进程以应用新代理",
+        logger.warning("%s，热切换到 %s:%d（无需重启）",
                        reason, new_best["server"], new_best["port"])
-        os._exit(0)   # 由 Docker restart 策略拉起，启动时加载新代理
+        if await _hotswap_all(bot, userbot_manager, new_best):
+            holder["candidate"] = new_best
 
 
 async def _reconnect_proxy_check(fail_streak: int, config: dict,
-                                 current: dict | None) -> None:
-    """重连连续失败时尝试重新选优；确认代理变更或多次无效则退出重启。"""
+                                 current: dict | None) -> dict | None:
+    """重连失败时的代理自愈：重新拉榜测速选优，选出新代理就地应用。
+
+    返回与当前不同的新候选（调用方负责应用到客户端并重连）；
+    没有可换的新代理返回 None。第 1 次失败就重选（auto 模式），
+    之后每 3 次失败再选一轮；连续 9 次失败且没有新代理可换才退出
+    进程，交给 Docker 重启兜底。
+    """
     cfg = normalize_config(config.get("proxy"))
     if str(cfg.get("mode") or "off").lower() != "auto":
-        return
-    if fail_streak % 3 != 0:
-        return
+        return None
+    if fail_streak != 1 and fail_streak % 3 != 0:
+        return None
     logger.warning("连续 %d 次重连失败，重新执行代理选优...", fail_streak)
     # 从状态文件读当前代理，避免 /speedall /speedtop 热切换后误判"已变更"
     current = state_to_candidate(load_state(cfg["state_file"])) or current
@@ -211,20 +227,61 @@ async def _reconnect_proxy_check(fail_streak: int, config: dict,
         state = await run_refresh(cfg)
     except Exception as exc:
         logger.error("重连期间的代理选优失败: %s", exc)
-        return
+        state = None
     if state is None:
         if fail_streak >= 9:
             logger.critical("重连与代理选优均持续失败，退出进程等待 Docker 重启")
             sys.exit(1)
-        return
+        return None
     new_best = state_to_candidate(state)
+    if new_best is None:
+        if fail_streak >= 9:
+            logger.critical("代理选优无可用结果，退出进程等待 Docker 重启")
+            sys.exit(1)
+        return None
     if current is None or _candidate_key(new_best) != _candidate_key(current):
-        logger.warning("代理已变更（%s:%d），重启进程以应用",
+        logger.warning("已选出新代理 %s:%d，就地应用（无需重启）",
                        new_best["server"], new_best["port"])
-        os._exit(0)
-    elif fail_streak >= 9:
+        return new_best
+    if fail_streak >= 9:
         logger.critical("代理未变更但持续无法连接，退出进程等待 Docker 重启")
         sys.exit(1)
+    return None
+
+
+def _apply_proxy_to_all(bot: TelegramClient,
+                        userbot_manager: UserBotManager,
+                        candidate: dict) -> None:
+    """把新代理就地写进 Bot 与所有 UserBot（不重连）。
+
+    已连接客户端在下次 connect() 生效；尚未创建的 UserBot 客户端
+    （启动阶段）由 manager 的 proxy 属性在 start() 时生效。
+    """
+    from core.proxy_hotswap import apply_proxy_to_client
+    conn_cls, proxy_tuple = build_telethon_proxy(candidate)
+    apply_proxy_to_client(bot, conn_cls, proxy_tuple)
+    userbot_manager.proxy = (conn_cls, proxy_tuple)
+    for c in userbot_manager.clients:
+        apply_proxy_to_client(c, conn_cls, proxy_tuple)
+
+
+async def _hotswap_all(bot: TelegramClient,
+                       userbot_manager: UserBotManager,
+                       candidate: dict) -> bool:
+    """对 Bot 与所有 UserBot 执行代理热切换（已连接时断开重连）。
+
+    返回是否全部成功；单个客户端失败会自动回滚旧代理。
+    """
+    from core.proxy_hotswap import hot_swap_proxy
+    clients = [bot] + list(userbot_manager.clients)
+    labels = ["Bot"] + ["UserBot#%d" % i for i in range(len(clients) - 1)]
+    results = await hot_swap_proxy(clients, candidate, labels=labels)
+    for r in results:
+        if not r["ok"]:
+            logger.error("%s 热切换失败：%s（回滚%s）", r["label"],
+                         r.get("error"),
+                         "成功" if r.get("rolled_back") else "失败")
+    return all(r["ok"] for r in results)
 
 
 async def _start_clients(bot: TelegramClient, userbot_manager: UserBotManager,
@@ -244,7 +301,7 @@ async def _boot_start_clients(bot: TelegramClient,
     """首次启动连接：失败不直接崩溃，先重新选代理再重试。
 
     - auto 模式下连接失败会立即重新选优；选出与当前不同的代理时
-      重启进程应用（Docker restart 拉起后走新代理）；
+      就地应用到客户端后重试（不退出进程，热切换自愈链的一部分）；
     - 选优结果未变化（整批代理都不可用）则退避后原地重试连接，
       避免快速崩溃循环空耗 Docker 重启次数；
     - UserBotNotAuthorized 属于配置/部署问题（需人工登录），向上抛出。
@@ -273,11 +330,13 @@ async def _boot_start_clients(bot: TelegramClient,
                 nb = state_to_candidate(state) if state else None
                 if nb and (proxy_candidate is None or
                            _candidate_key(nb) != _candidate_key(proxy_candidate)):
-                    logger.warning("已选出新代理 %s:%d，重启进程以应用",
+                    # 就地应用新代理后重试连接，不再退出进程（Docker 重启兜底已不必要）
+                    logger.warning("已选出新代理 %s:%d，就地应用后重试连接",
                                    nb["server"], nb["port"])
-                    await db.close()
-                    os._exit(0)
-                logger.warning("代理选优结果未变化（可能整批代理都不可用），退避后原地重试")
+                    proxy_candidate = nb
+                    _apply_proxy_to_all(bot, userbot_manager, nb)
+                else:
+                    logger.warning("代理选优结果未变化（可能整批代理都不可用），退避后原地重试")
             await asyncio.sleep(min(15 * attempt, 60))
 
 
@@ -416,13 +475,18 @@ async def main():
     await _setup_bot(bot, userbot_manager, db, config)
 
     # === 每小时代理复测（auto 模式）===
+    proxy_holder = {"candidate": proxy_candidate,
+                    "bot": bot, "userbot_manager": userbot_manager}
     if str(normalize_config(config.get("proxy")).get("mode") or "off").lower() == "auto":
-        asyncio.create_task(_proxy_refresher(config, proxy_candidate))
+        asyncio.create_task(_proxy_refresher(config, proxy_holder))
         logger.info("代理自动复测任务已启动（每 %d 分钟）",
                     max(5, int(normalize_config(config.get("proxy")).get("refresh_minutes", 60))))
 
-    # === 运行 + 断线重连循环 ===
-    reconnect_count = 0
+    # === 运行 + 断线自愈循环 ===
+    # 代理中途失效的自愈链：Telethon 内部重连（10×5s）失败 → 应用层
+    # 短退避重连（5s 翻倍封顶 30min）→ 第 1 次失败即重新拉榜测速选优，
+    # 选出新代理就地应用到所有客户端并立即重连（热切换，不重启）；
+    # 连续 9 次失败且无新代理可换才退出进程交 Docker 重启兜底。
     try:
         while True:
             try:
@@ -433,35 +497,39 @@ async def main():
             except Exception as e:
                 logger.error("未预期异常: %s", e, exc_info=True)
 
-            # run_until_disconnected() 返回 → 说明连接已断开，进入重连
-            reconnect_count += 1
-            if reconnect_count > MAX_RECONNECT_ATTEMPTS:
-                logger.critical(
-                    "连续 %d 次重连均失败，进程退出（交由 systemd 重启）",
-                    MAX_RECONNECT_ATTEMPTS,
+            # run_until_disconnected() 返回 → 连接已断开，进入重连流程
+            reconnect_count = 0
+            while True:
+                reconnect_count += 1
+                if reconnect_count > MAX_RECONNECT_ATTEMPTS:
+                    logger.critical(
+                        "连续 %d 次重连均失败，进程退出（等待 Docker 重启）",
+                        reconnect_count - 1)
+                    sys.exit(1)
+
+                delay = min(
+                    RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
+                    RECONNECT_MAX_DELAY,
                 )
-                sys.exit(1)
+                logger.warning("第 %d/%d 次重连，等待 %d 秒...",
+                               reconnect_count, MAX_RECONNECT_ATTEMPTS, delay)
+                await asyncio.sleep(delay)
 
-            delay = min(
-                RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
-                RECONNECT_MAX_DELAY,
-            )
-            logger.warning(
-                "第 %d/%d 次重连，等待 %d 秒...",
-                reconnect_count, MAX_RECONNECT_ATTEMPTS, delay,
-            )
-            await asyncio.sleep(delay)
-
-            try:
-                await bot.connect()
-                await userbot_manager.connect_all()
-                reconnect_count = 0   # 重连成功，重置计数
-                logger.info("重连成功")
-            except Exception as e:
-                logger.error("重连失败: %s", e)
-                # 回到 while 循环顶部，reconnect_count 已递增，继续退避
-                # 自动代理模式下连续失败时触发重新选优（可能切换代理并重启）
-                await _reconnect_proxy_check(reconnect_count, config, proxy_candidate)
+                try:
+                    await bot.connect()
+                    await userbot_manager.connect_all()
+                    logger.info("重连成功")
+                    break
+                except Exception as e:
+                    logger.error("重连失败: %s", e)
+                    new_candidate = await _reconnect_proxy_check(
+                        reconnect_count, config, proxy_candidate)
+                    if new_candidate is not None:
+                        proxy_candidate = new_candidate
+                        proxy_holder["candidate"] = new_candidate
+                        _apply_proxy_to_all(bot, userbot_manager, new_candidate)
+                        # 新代理就位：退避从头计，下轮 5 秒后即用新代理重连
+                        reconnect_count = 0
     finally:
         # 正常退出/收到 KeyboardInterrupt 时把 WAL 合并回主库，确保宿主机的
         # bot.db 是完整一致的一份（进程被强杀时 WAL 也会在下次打开自动回放）。
