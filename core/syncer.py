@@ -538,12 +538,13 @@ class Syncer(ForwardingComponent):
         async def _render() -> str:
             elapsed = (datetime.now().astimezone() - started_at).total_seconds()
             speed = (done - plan.done_before) / elapsed if elapsed > 0 else 0
-            eta = ((plan.total - done) / speed) if (plan.total and speed > 0) else None
+            processed = done + failed + skipped
+            eta = ((plan.total - processed) / speed) if (plan.total and speed > 0) else None
             return (
                 f"📥 克隆任务 #{task_id}\n"
                 f"📌 源: {src_label}\n"
                 f"🎯 目标: {tgt_label}\n"
-                f"进度: {progress_bar(done, plan.total)}\n"
+                f"进度: {progress_bar(processed, plan.total)}\n"
                 f"游标: msg_id={cursor} · 速率 {speed:.1f} 条/秒\n"
                 f"成功 {done - plan.done_before:,} · 失败 {failed:,} · 跳过 {skipped:,}\n"
                 f"已用 {format_duration(elapsed)} · 剩余约 {format_duration(eta)}"
@@ -714,7 +715,7 @@ class Syncer(ForwardingComponent):
             logger.info("克隆任务 #%s 已暂停，游标 %s（可随时续传）", task_id, cursor)
             await _report(
                 f"⏸ 克隆任务 #{task_id} 已暂停\n"
-                f"{progress_bar(done, plan.total)}\n"
+                f"{progress_bar(done + failed + skipped, plan.total)}\n"
                 f"游标已保存: msg_id={cursor}（点「继续」即可接着跑）")
             return
 
@@ -747,7 +748,7 @@ class Syncer(ForwardingComponent):
 
         await _report(
             "✅ 克隆完成"
-            f"\n{progress_bar(done, plan.total or done)}"
+            f"\n{progress_bar(done + failed + skipped, plan.total or done)}"
             f"\n• 本次新增: {done - plan.done_before:,} 条"
             f"{restricted_line}"
             f"\n• 失败: {failed:,} 条 · 跳过: {skipped:,} 条"

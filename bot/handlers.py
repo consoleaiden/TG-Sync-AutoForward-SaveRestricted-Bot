@@ -2357,8 +2357,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if t["type"] in models.CLONE_TASK_TYPES:
             done = int(t.get("done_count") or 0)
             total = int(t.get("total_count") or 0) or None
+            # 已处理口径（成功+失败+跳过），处理完即为 100%
+            processed = (done + int(t.get("fail_count") or 0)
+                         + int(t.get("skip_count") or 0))
             text += (
-                f"\n进度: {progress_bar(done, total)}"
+                f"\n进度: {progress_bar(processed, total)}"
                 f"\n游标: msg_id={int(t.get('last_synced_msg_id') or 0)}"
                 f"\n成功 {done:,} · 失败 {int(t.get('fail_count') or 0):,}"
                 f" · 跳过 {int(t.get('skip_count') or 0):,}")

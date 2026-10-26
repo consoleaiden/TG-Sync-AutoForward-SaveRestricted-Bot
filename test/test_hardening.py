@@ -310,6 +310,32 @@ class SyncerHardeningTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("缺口 1 条", final)
         self.assertIn("/retryfail", final)
 
+    async def test_completion_progress_reaches_100_percent(self):
+        """进度条口径 = 已处理（成功+失败+跳过），处理完必须显示 100%。"""
+        # 场景 1：一半已映射（跳过）+ 一半成功
+        task_id = await models.create_task(self.db, "sync", -1001, -1002, "copy")
+        for i in range(1, 6):
+            await models.save_message_map(self.db, task_id, i, 900 + i)
+        stub = StubForwarder(self.syncer, task_id)
+        self.syncer.forwarder = stub
+        await self.syncer.start_sync(task_id, -1001, -1002, "copy",
+                                     notify_chat_id=-999,
+                                     userbot=self.userbot)
+        final = self.bot.texts[-1]
+        self.assertIn("100.0%", final,
+                      "全部处理完（成功+跳过=总数）进度应为 100%")
+
+        # 场景 2：有失败条目（未补发）也属「已处理」，同样应到 100%
+        task_id2 = await models.create_task(self.db, "sync", -1001, -1002, "copy")
+        stub2 = StubForwarder(self.syncer, task_id2, fail_ids={7})
+        self.syncer.forwarder = stub2
+        await self.syncer.start_sync(task_id2, -1001, -1002, "copy",
+                                     notify_chat_id=-999,
+                                     userbot=self.userbot)
+        final2 = self.bot.texts[-1]
+        self.assertIn("100.0%", final2, "失败也算已处理，进度应到 100%")
+        self.assertIn("缺口 1 条", final2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -435,6 +435,10 @@ class MenuController:
         status = STATUS_EMOJI.get(t["status"], "❓")
         done = int(t.get("done_count") or 0)
         total = int(t.get("total_count") or 0) or None
+        # 进度口径 = 已处理（成功+失败+跳过）/ 总数，全部处理完即为 100%；
+        # 只用成功数会因为服务消息/去重跳过永远到不了 100%
+        processed = (done + int(t.get("fail_count") or 0)
+                     + int(t.get("skip_count") or 0))
         src_title = t.get("source_title") or await self._format_display(
             t["source_chat_id"], t["source_topic_id"])
         tgt_title = t.get("target_title") or await self._format_display(
@@ -449,7 +453,7 @@ class MenuController:
         ]
         if t["type"] in models.CLONE_TASK_TYPES:
             lines.append(f"起点: {start}")
-            lines.append(f"进度: {progress_bar(done, total)}")
+            lines.append(f"进度: {progress_bar(processed, total)}")
             lines.append(f"游标: msg_id={int(t.get('last_synced_msg_id') or 0)}")
             lines.append(
                 f"成功 {done:,} · 失败 {int(t.get('fail_count') or 0):,}"
