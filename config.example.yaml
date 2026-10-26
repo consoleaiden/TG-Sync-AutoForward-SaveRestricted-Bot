@@ -96,6 +96,13 @@ clone:
   stall_alert_seconds: 600
   # 克隆跑完后自动转为「持续监听」后续新消息（任务详情里可单独关闭）
   follow_after_finish: true
+  # 评论区克隆：帖子克隆完后进入讨论组把评论区内容也克隆到目标频道。
+  # hint = 帖子文本包含 comment_hint 提示词才进（推荐：这类频道把真内容放评论）；
+  # all  = 凡开启评论区的帖子都克隆（克隆量与请求频率显著上升，慎用）；
+  # off  = 禁用。评论区需 UserBot 能读到讨论组，走统一降级策略链。
+  comments_mode: hint
+  comment_hint: "评论区获取" # 提示词，命中即克隆该帖评论区；改空串后等价于 all 判定失败即禁用
+  comment_max: 1000 # 单个帖子评论区克隆上限（防止异常巨大的评论区拖垮任务）
 
 # ── MTProto 代理自动选优（网络无法直连 Telegram 时启用）────────────────
 # 数据来源：telegram-mtproto-proxy-list 项目每小时更新的 top40.json；

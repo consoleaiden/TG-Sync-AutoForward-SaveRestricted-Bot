@@ -13,6 +13,7 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 - **Live Progress** — Progress bar, percentage, speed and ETA, refreshed in place on a single message
 - **Integrity Report** — Every finished clone reports `source N / mapped M / coverage X% / gap K`, so an archive run tells you at a glance whether it got everything
 - **Retry Failed Items** — `/klfail` lists what failed and why; `/retryfail <id|all>` re-sends them without touching the resume cursor
+- **Comment Threads** — when a post contains the hint text「评论区获取」(configurable), the bot also clones its whole comment thread from the discussion group; a clone-all mode is available
 - **Adjustable Speed** — `/sd` command tunes forwarding pace for Bot and UserBot separately (presets or custom ranges), effective immediately without restart
 - **Resumable** — Pause, crash or restart and it continues from the saved cursor with no duplicates or gaps
 - **Idempotent** — A `UNIQUE(task_id, source_msg_id)` index on `message_map` plus a pre-send lookup means re-runs never duplicate messages in the target

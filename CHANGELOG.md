@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added（评论区克隆：hint / all / off 三种模式）
+- 克隆帖子时自动检测评论区：`hint` 模式（默认）帖子文本含「评论区获取」提示词、
+  `all` 模式凡开启评论区的帖子，都会在克隆完本条后进入讨论组，
+  把评论区内容全部克隆到目标频道，再继续下一条。
+- 评论区读取用 UserBot（`replies.discussion_id` 定位讨论组），每条评论仍走
+  统一降级策略链；单帖上限 `clone.comment_max`（默认 1000）。
+- 评论不计入覆盖率分母，完成消息单独汇报「• 评论区: N 个帖子克隆了 M 条评论」；
+  中途取消即停；克隆失败只计数不登记 failed_messages（评论不占续跑游标）。
+
 ### Added（代理测速命令：/speedall、/speedtop）
 - 新增 `core/proxy_speedtest.py`：拉取 telegram-mtproto-proxy-list 榜单
   （proxies.json 数组格式 / top40.json 字典格式，自动去重）→ 并发 FakeTLS
