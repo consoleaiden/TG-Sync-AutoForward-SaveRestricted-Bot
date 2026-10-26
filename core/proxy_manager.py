@@ -351,6 +351,7 @@ def normalize_config(proxy_cfg: dict | None) -> dict:
     probe.setdefault("connect_timeout", PROBE_CONNECT_TIMEOUT)
     probe.setdefault("dc_validate_top", DC_VALIDATE_TOP)
     probe.setdefault("dc_validate_timeout", DC_VALIDATE_TIMEOUT)
+    cfg.setdefault("stale_minutes", 30)
     cfg["probe"] = probe
     return cfg
 

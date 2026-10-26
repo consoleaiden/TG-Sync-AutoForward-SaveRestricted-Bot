@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed（启动崩溃循环：死代理 + 状态过期沿用）
+- **启动连接失败不再直接崩溃**：`_boot_start_clients` 重试循环（默认 3 次）——
+  auto 模式下连接失败立即重新代理选优，选出不同代理则重启进程应用；
+  选优结果未变化（整批代理不可用）则退避后原地重试，避免快速崩溃循环。
+- **过期代理状态不再沿用**（`proxy.stale_minutes`，默认 30 分钟）：此前
+  `data/proxy.json` 里 15 小时前的死代理会被直接拿来连接，重试 10 次后
+  `ConnectionError` 崩掉进程，Docker 重启后又用同一个死代理 → 崩溃循环。
+- 新增 `test/test_boot_reconnect.py`（7 例），全量 222 例通过。
+
 ### Added（/bf 克隆并发命令）
 - **`/bf` 命令**：`/bf` 查看当前并发与排队状态，`/bf 2`（1~10）在线调整同时
   克隆上限——立即生效（排队中的任务自动开始）、持久化到数据库重启不丢。

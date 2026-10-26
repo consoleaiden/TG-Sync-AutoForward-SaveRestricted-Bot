@@ -3,6 +3,7 @@ import sys
 import asyncio
 import logging
 import yaml
+from datetime import datetime, timezone
 from telethon import TelegramClient
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
@@ -67,6 +68,17 @@ def _latency_metric(candidate: dict) -> float:
     return 10 ** 9
 
 
+def _state_age_minutes(state: dict) -> float:
+    """状态文件的更新时间距今多少分钟；缺失/解析失败视为无限旧。"""
+    try:
+        t = datetime.fromisoformat(state.get("updated_at"))
+    except (TypeError, ValueError):
+        return float("inf")
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - t).total_seconds() / 60
+
+
 async def _resolve_proxy(config: dict) -> tuple | None:
     """根据 config 中的 proxy 配置解析出 (connection 类, proxy 元组)。
 
@@ -99,6 +111,15 @@ async def _resolve_proxy(config: dict) -> tuple | None:
         sys.exit(1)
 
     state = load_state(cfg["state_file"])
+    # 状态过期就不沿用：代理是易逝资源，用几小时前的选优结果连接，
+    # 大概率撞上已失效的代理（曾导致启动崩溃循环）
+    stale_minutes = max(1, int(cfg.get("stale_minutes", 30)))
+    if state is not None and _state_age_minutes(state) > stale_minutes:
+        cur = state_to_candidate(state)
+        logger.warning("已选代理 %s:%d 的状态已过期（更新于 %s，阈值 %d 分钟），重新选优",
+                       cur.get("server"), cur.get("port"),
+                       state.get("updated_at", "?"), stale_minutes)
+        state = None
     if state is None:
         logger.info("未找到可用代理状态，开始执行代理选优...")
         for attempt in range(1, 4):
@@ -207,6 +228,51 @@ async def _start_clients(bot: TelegramClient, userbot_manager: UserBotManager,
     logger.info("Bot 客户端已启动")
 
     await userbot_manager.start()
+
+
+async def _boot_start_clients(bot: TelegramClient,
+                              userbot_manager: UserBotManager,
+                              db: Database, config: dict,
+                              proxy_candidate: dict | None,
+                              *, max_attempts: int = 3) -> None:
+    """首次启动连接：失败不直接崩溃，先重新选代理再重试。
+
+    - auto 模式下连接失败会立即重新选优；选出与当前不同的代理时
+      重启进程应用（Docker restart 拉起后走新代理）；
+    - 选优结果未变化（整批代理都不可用）则退避后原地重试连接，
+      避免快速崩溃循环空耗 Docker 重启次数；
+    - UserBotNotAuthorized 属于配置/部署问题（需人工登录），向上抛出。
+    """
+    cfg = normalize_config(config.get("proxy"))
+    boot_auto = str(cfg.get("mode") or "off").lower() == "auto"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await _start_clients(bot, userbot_manager, config)
+            return
+        except (ConnectionError, OSError, TimeoutError) as e:
+            logger.warning("启动连接失败（第 %d/%d 次）: %s",
+                           attempt, max_attempts, e)
+            if attempt >= max_attempts:
+                logger.critical("启动连接连续 %d 次失败，进程退出（等待 Docker 重启）",
+                                attempt)
+                await db.close()
+                sys.exit(1)
+            if boot_auto:
+                logger.warning("重新执行代理选优…")
+                try:
+                    state = await run_refresh(cfg)
+                except Exception as exc:
+                    logger.error("代理选优失败: %s", exc)
+                    state = None
+                nb = state_to_candidate(state) if state else None
+                if nb and (proxy_candidate is None or
+                           _candidate_key(nb) != _candidate_key(proxy_candidate)):
+                    logger.warning("已选出新代理 %s:%d，重启进程以应用",
+                                   nb["server"], nb["port"])
+                    await db.close()
+                    os._exit(0)
+                logger.warning("代理选优结果未变化（可能整批代理都不可用），退避后原地重试")
+            await asyncio.sleep(min(15 * attempt, 60))
 
 
 async def _setup_bot(bot: TelegramClient, userbot_manager: UserBotManager,
@@ -328,9 +394,10 @@ async def main():
     # 初始化多 UserBot 管理器
     userbot_manager = UserBotManager(config, proxy=proxy)
 
-    # === 首次启动 ===
+    # === 首次启动（连接失败会重新选代理并重试，不再直接崩溃循环） ===
     try:
-        await _start_clients(bot, userbot_manager, config)
+        await _boot_start_clients(bot, userbot_manager, db, config,
+                                  proxy_candidate)
     except UserBotNotAuthorized as e:
         # 这是配置/部署问题，不是程序缺陷：打印可执行的修复步骤后退出，
         # 完成登录后容器重启即可自动恢复。
