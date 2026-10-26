@@ -8,7 +8,6 @@ import asyncio
 import html
 import json
 import logging
-import os
 import re
 import time
 
@@ -1867,9 +1866,10 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     # ── 代理测速命令：/speedall（全量榜） / /speedtop（前 40 名）──────────
     _speedtest_busy = False
+    _hotswap_lock = asyncio.Lock()
 
     async def _run_proxy_speedtest(event, kind: str) -> None:
-        """拉取榜单 → 本机测速 → 选优写状态 → 自动重启应用。"""
+        """拉取榜单 → 本机测速 → 选优写状态 → 热切换到新代理（无需重启）。"""
         nonlocal _speedtest_busy
         if not await _require_admin(event):
             return
@@ -1935,15 +1935,55 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         if _sync_tasks:
             await event.reply(
-                text + "\n\n⚠️ 当前有克隆任务在跑，为免中断未自动重启。\n"
-                       "任务结束后重启容器即按新代理连接。")
+                text + "\n\n⚠️ 当前有克隆任务在跑，为免中断未执行热切换。\n"
+                       "任务结束后重启容器即按新代理连接；或届时再发一次本命令热切换。")
             return
-        await event.reply(text + "\n🔄 10 秒后自动重启进程以应用新代理…")
-        async def _apply_restart() -> None:
-            await asyncio.sleep(10)
-            logger.info("测速选优完成，重启进程应用新代理")
-            os._exit(0)
-        asyncio.create_task(_apply_restart())
+
+        await event.reply(
+            text + "\n🔄 正在热切换到新代理（Bot 与 UserBot 依次重连，"
+                   "约几秒到几十秒，无需重启）…")
+
+        async def _apply_hotswap() -> None:
+            nonlocal _speedtest_busy
+            async with _hotswap_lock:
+                _speedtest_busy = True
+                try:
+                    from core.proxy_hotswap import hot_swap_proxy
+                    clients = [bot]
+                    if userbot_manager is not None:
+                        clients.extend(userbot_manager.clients)
+                    labels = ["Bot"] + [
+                        "UserBot#%d" % i for i in range(len(clients) - 1)]
+                    results = await hot_swap_proxy(clients, best, labels=labels)
+                    lines = []
+                    for r in results:
+                        if r["ok"]:
+                            lines.append(f"✅ {r['label']} 已切到 "
+                                         f"{best['server']}:{best['port']}")
+                        elif r.get("rolled_back"):
+                            lines.append(f"❌ {r['label']} 切换失败"
+                                         f"（{r.get('error')}），已回滚原代理")
+                        else:
+                            lines.append(f"❌ {r['label']} 切换失败"
+                                         f"（{r.get('error')}），且回滚失败，"
+                                         "等待应用层重连/重启")
+                    if all(r["ok"] for r in results):
+                        await event.reply(
+                            "🔥 代理热切换完成，立即生效、无需重启\n"
+                            + "\n".join(lines))
+                    else:
+                        await event.reply(
+                            "⚠️ 代理热切换部分完成\n" + "\n".join(lines)
+                            + "\n\n💡 重启容器后所有客户端都会按新代理连接。")
+                except Exception as e:
+                    logger.exception("代理热切换异常")
+                    await event.reply(
+                        f"❌ 代理热切换异常：{type(e).__name__}: {e}\n"
+                        "新代理已写入状态文件，重启容器即按新代理连接。")
+                finally:
+                    _speedtest_busy = False
+
+        asyncio.create_task(_apply_hotswap())
 
     @bot.on(events.NewMessage(pattern=r"^/(speedall|speedtop)(?:@\w+)?(?=\s|$)"))
     async def on_proxy_speedtest(event):

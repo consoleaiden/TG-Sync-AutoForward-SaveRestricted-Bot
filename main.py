@@ -156,6 +156,10 @@ async def _proxy_refresher(config: dict, current: dict | None) -> None:
         if not state:
             continue
 
+        # 每轮从状态文件读当前代理：/speedall /speedtop 的热切换只更新
+        # 状态文件与活客户端，不重启进程，用启动时捕获的旧值会误判"已变更"
+        current = state_to_candidate(load_state(cfg["state_file"])) or current
+
         new_best = state_to_candidate(state)
         if current is None:
             logger.warning("已选出可用代理 %s:%d，重启进程以应用",
@@ -201,6 +205,8 @@ async def _reconnect_proxy_check(fail_streak: int, config: dict,
     if fail_streak % 3 != 0:
         return
     logger.warning("连续 %d 次重连失败，重新执行代理选优...", fail_streak)
+    # 从状态文件读当前代理，避免 /speedall /speedtop 热切换后误判"已变更"
+    current = state_to_candidate(load_state(cfg["state_file"])) or current
     try:
         state = await run_refresh(cfg)
     except Exception as exc:

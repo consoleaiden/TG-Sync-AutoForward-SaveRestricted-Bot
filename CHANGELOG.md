@@ -21,9 +21,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   握手测速（单台超时/异常只计失败不中断）→ DC 往返校验 → 选优写入
   data/proxy.json（与启动选优同一机制）。
 - 新增命令 `/speedtop`（前 40 名）与 `/speedall`（全量约 1000 条，带进度编辑）：
-  测速完成自动把最优代理设为当前使用，无运行中任务时 10 秒后自动重启进程生效，
-  有任务在跑则提示稍后手动重启；`proxy.mode=off` 时拒绝执行并说明。
+  测速完成自动把最优代理设为当前使用；`proxy.mode=off` 时拒绝执行并说明。
 - 全部代理不可用时报错并保持旧代理不变；防重入（测速进行中拒绝新请求）。
+
+### Changed（测速后热切换代理，无需重启）
+- 新增 `core/proxy_hotswap.py`：基于 Telethon 官方 `set_proxy()` 语义的
+  运行中换代理——替换连接类（按 secret 类型 FakeTLS/Randomized/Abridged）
+  与代理元组后 `disconnect()+connect()`，Bot 与全部 UserBot 逐个切换，
+  单客户端失败自动回滚旧代理并重连，互不影响。
+- 测速完成不再 `os._exit` 重启进程：无克隆任务在跑时直接热切换（几秒生效），
+  有任务在跑时提示任务结束后再执行；新代理始终先写入状态文件，
+  重启兜底永远可用。
+- main.py 定时复测/重连选优改为每轮从状态文件读当前代理，
+  避免热切换后被误判「代理已变更」而多余重启。
+- 新增 `test/test_proxy_hotswap.py`（10 例）。
 
 ### Fixed（克隆完成但任务列表进度不足 100%）
 - 进度口径统一为「已处理 = 成功 + 失败 + 跳过」：此前进度条只画成功数，
