@@ -32,6 +32,7 @@ logger = logging.getLogger("tg_forward_bot.menu")
 
 WIZARD_TTL = 15 * 60       # 向导空闲超时（秒）
 CALLBACK_PREFIX = "m:"
+PAGE_SIZE = 5              # 任务列表每页条数
 
 _STEP_ORDER = {
     "clone": ("src", "target", "start", "mode", "confirm"),
@@ -319,30 +320,58 @@ class MenuController:
             return f"{min(100, done * 100 // total)}%"
         return "—"
 
-    async def render_tasks(self, event, edit: bool = True):
-        """克隆任务列表：已完成的也保留，并标出是否在持续监听。"""
+    @staticmethod
+    def _page_bounds(total: int, page: int) -> tuple[int, int, int]:
+        """返回 (页码, 总页数, 偏移量)；页码越界时收敛到合法范围。"""
+        pages = max(1, (int(total) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(int(page or 0), pages - 1))
+        return page, pages, page * PAGE_SIZE
+
+    @staticmethod
+    def _pager_buttons(prefix: str, page: int, pages: int,
+                       total: int) -> list:
+        """翻页控件：◀ 上一页 · 第 x/y 页 · 下一页 ▶（首页/末页自动省略）。"""
+        if pages <= 1:
+            return []
+        row = []
+        if page > 0:
+            row.append(Button.inline("◀ 上一页", data=f"{prefix}:p{page - 1}"))
+        row.append(Button.inline(f"· {page + 1}/{pages} 页 ·",
+                                 data=f"{prefix}:p{page}"))
+        if page < pages - 1:
+            row.append(Button.inline("下一页 ▶", data=f"{prefix}:p{page + 1}"))
+        return [row]
+
+    async def render_tasks(self, event, page: int = 0, edit: bool = True):
+        """克隆任务列表（分页，每页 5 条）：已完成的也保留，并标出是否持续监听。"""
+        total = await models.count_tasks_for_list(
+            self.db, models.CLONE_TASK_TYPES)
+        running_all = await models.count_tasks_for_list(
+            self.db, models.CLONE_TASK_TYPES, statuses=("running",))
+        page, pages, offset = self._page_bounds(total, page)
         tasks = await models.get_tasks_for_list(
-            self.db, models.CLONE_TASK_TYPES, limit=12)
+            self.db, models.CLONE_TASK_TYPES, limit=PAGE_SIZE, offset=offset)
         if not tasks:
             text = ("📭 还没有克隆任务\n\n"
                     "点「新建克隆任务」创建第一个，或用 /kl <频道链接>。")
             buttons = [[Button.inline("📥 新建克隆任务", data="m:new:clone")],
                        [Button.inline("« 主菜单", data="m:home")]]
         else:
-            running = sum(1 for t in tasks if t["status"] == "running")
             following = sum(1 for t in tasks if int(t.get("follow") or 0))
-            text = (f"📋 克隆任务（{len(tasks)} 个 · 运行中 {running} · "
-                    f"持续监听 {following}）\n"
-                    "已完成的记录会一直保留，点一项可看详情、开关持续监听。")
+            text = (f"📋 克隆任务（共 {total} 个 · 运行中 {running_all} · "
+                    f"本页持续监听 {following}）\n"
+                    f"第 {page + 1}/{pages} 页，每页 {PAGE_SIZE} 条；"
+                    "点一项可看详情、开关持续监听。")
             buttons = []
-            for t in tasks[:12]:
+            for t in tasks:
                 status = STATUS_EMOJI.get(t["status"], "❓")
                 name = t.get("source_title") or str(t["source_chat_id"])
                 follow = "🛰" if int(t.get("follow") or 0) else ""
                 label = (f"{status}📥{follow} #{t['id']} {name} "
                          f"{self._pct_text(t)}")
                 buttons.append([Button.inline(label[:52], data=f"m:task:{t['id']}")])
-            buttons.append([Button.inline("🔄 刷新", data="m:tasks"),
+            buttons.extend(self._pager_buttons("m:tasks", page, pages, total))
+            buttons.append([Button.inline("🔄 刷新", data=f"m:tasks:p{page}"),
                             Button.inline("📡 监听列表", data="m:monitors")])
             buttons.append([Button.inline("« 主菜单", data="m:home")])
         if edit:
@@ -376,20 +405,25 @@ class MenuController:
                 logger.debug("读取监控实时进度失败 #%s: %s", task["id"], e)
         return out
 
-    async def render_monitors(self, event, edit: bool = True):
-        """监听任务总览：看得到设置了哪些监听、各自转发了多少。"""
-        tasks = await models.get_tasks_by_type(self.db, "monitor")
+    async def render_monitors(self, event, page: int = 0, edit: bool = True):
+        """监听任务总览（分页，每页 5 条）：看得到设置了哪些监听、各自转发了多少。"""
+        total = await models.count_tasks_by_type(self.db, "monitor")
+        running_all = await models.count_tasks_for_list(
+            self.db, ("monitor",), statuses=("running",))
+        page, pages, offset = self._page_bounds(total, page)
+        tasks = await models.get_tasks_by_type(
+            self.db, "monitor", limit=PAGE_SIZE, offset=offset)
         if not tasks:
             text = ("📡 还没有实时监控任务\n\n"
                     "监控会把源频道的新消息实时转发到目标，"
-                    "创建后在这里能看到每个任务的源、目标与已转发条数。")
+                    "克隆任务完成后也会自动出现在这里。")
             buttons = [[Button.inline("👁 新建实时监控", data="m:new:monitor")],
                        [Button.inline("📥 新建克隆任务", data="m:new:clone")],
                        [Button.inline("« 主菜单", data="m:home")]]
         else:
-            running = sum(1 for t in tasks if t["status"] == "running")
-            lines = [f"📡 监听任务（共 {len(tasks)} 个，运行中 {running} 个）", ""]
-            for t in tasks[:10]:
+            lines = [f"📡 监听任务（共 {total} 个，运行中 {running_all} 个）",
+                     f"第 {page + 1}/{pages} 页，每页 {PAGE_SIZE} 条", ""]
+            for t in tasks:
                 stats = await self._monitor_stats(t)
                 status = STATUS_EMOJI.get(t["status"], "❓")
                 src = t.get("source_title") or str(t["source_chat_id"])
@@ -408,13 +442,14 @@ class MenuController:
                     lines.append(f"   ⚠️ {str(stats['last_error'])[:60]}")
                 lines.append("")
             buttons = []
-            for t in tasks[:10]:
+            for t in tasks:
                 status = STATUS_EMOJI.get(t["status"], "❓")
                 src = (t.get("source_title") or str(t["source_chat_id"]))[:24]
                 buttons.append([Button.inline(
                     f"{status} #{t['id']} {src} {self._pct_text(t)}"[:52],
                     data=f"m:task:{t['id']}")])
-            buttons.append([Button.inline("🔄 刷新", data="m:monitors"),
+            buttons.extend(self._pager_buttons("m:monitors", page, pages, total))
+            buttons.append([Button.inline("🔄 刷新", data=f"m:monitors:p{page}"),
                             Button.inline("👁 新建监控", data="m:new:monitor")])
             buttons.append([Button.inline("« 主菜单", data="m:home")])
             text = "\n".join(lines).rstrip()
@@ -615,12 +650,24 @@ class MenuController:
             await self._render_step(event, wiz)
             return
 
-        if action == "tasks":
-            await self.render_tasks(event)
+        if action == "tasks" or action.startswith("tasks:"):
+            page = 0
+            if action.startswith("tasks:p"):
+                try:
+                    page = int(action.split("p", 1)[1])
+                except ValueError:
+                    page = 0
+            await self.render_tasks(event, page=page)
             return
 
-        if action == "monitors":
-            await self.render_monitors(event)
+        if action == "monitors" or action.startswith("monitors:"):
+            page = 0
+            if action.startswith("monitors:p"):
+                try:
+                    page = int(action.split("p", 1)[1])
+                except ValueError:
+                    page = 0
+            await self.render_monitors(event, page=page)
             return
 
         if action == "backup":
@@ -707,8 +754,8 @@ class MenuController:
                 "/kljx <链接> 120 — 从消息 120 开始继续克隆\n"
                 "/kljx <链接> 120-1000 — 只克隆 msg 120~1000\n"
                 "/jt <链接> — 只监听新消息\n"
-                "/kllb — 克隆任务列表（含已完成）\n"
-                "/jtlb — 监听任务列表\n"
+                "/kllb — 克隆任务列表（含已完成；/kllb 2 翻页，每页 5 条）\n"
+                "/jtlb — 监听任务列表（含克隆完成自动转来的；/jtlb 2 翻页）\n"
                 "/klfail — 查看失败条目（带任务 ID 看明细）\n"
                 "/retryfail <任务id|all> — 一键补发失败条目\n\n"
                 "【速度】\n"

@@ -848,12 +848,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         return ok, err
 
     async def _on_clone_completed(clone_task_id: int) -> None:
-        """克隆跑完后的默认动作：转成持续监听。"""
+        """克隆跑完后的默认动作：自动转成持续监听（进入监听任务列表）。
+
+        不再要求任务事先带 follow=1——克隆完成即视为「历史已搬完，接下来跟新」，
+        统一建/恢复对应的 monitor 任务；整体可用 config.clone.follow_after_finish
+        关闭。这样受限克隆（sync_restricted）与历史遗留任务也不会漏掉监听。
+        """
         cfg = config.get("clone") or {}
         if not cfg.get("follow_after_finish", True):
             return
         t = await models.get_task(db, clone_task_id) or {}
-        if not int(t.get("follow") or 0):
+        if t.get("type") not in models.CLONE_TASK_TYPES:
             return
         mid, err = await _ensure_follow_monitor(clone_task_id, notify=False)
         if mid:
@@ -1098,7 +1103,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         return resumed, failed
 
     # 克隆完成 → 默认转「持续监听」（config.clone.follow_after_finish 可关）
+    # 两条克隆链路都要挂上：普通克隆与受限消息克隆（sync_restricted）
     syncer.on_complete = _on_clone_completed
+    restricted_syncer.on_complete = _on_clone_completed
 
     menu = MenuController(
         bot,
@@ -1373,8 +1380,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "/kljx <链接> 120 — 从消息 120 开始继续克隆到最新\n"
             "/kljx <链接> 120-1000 — 只克隆 msg 120~1000\n"
             "/jt <链接> — 只监听新消息（不克隆历史）\n"
-            "/kllb — 克隆任务列表（含已完成，记录永久保留）\n"
-            "/jtlb — 监听任务列表\n"
+            "/kllb — 克隆任务列表（含已完成，记录永久保留；/kllb 2 翻页）\n"
+            "/jtlb — 监听任务列表（/jtlb 2 翻页，每页 5 条）\n"
             "/klfail — 查看哪些任务有失败（带 ID 看明细）\n"
             "/retryfail <任务id|all> — 一键补发失败条目，补齐缺口\n\n"
             "【工具】\n"
@@ -1526,19 +1533,36 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 f"ℹ️ 该监听已存在：任务 #{task_id}，未重复创建。\n"
                 "发 /jtlb 查看监听列表。")
 
-    @bot.on(events.NewMessage(pattern=r"^/kllb(?:@\w+)?$"))
-    async def on_clone_list(event):
-        """克隆任务列表（含已完成的，记录永久保留）。"""
-        if not await _require_admin(event):
-            return
-        await menu.render_tasks(event, edit=False)
+    def _cmd_page(raw: str, cmd: str) -> int | None:
+        """解析列表命令的页码参数（1 起）；非法输入返回 None。"""
+        arg = strip_command(raw, cmd).strip()
+        if not arg:
+            return 0
+        if not arg.isdigit() or int(arg) < 1:
+            return None
+        return int(arg) - 1
 
-    @bot.on(events.NewMessage(pattern=r"^/jtlb(?:@\w+)?$"))
-    async def on_monitor_list(event):
-        """监听任务列表。"""
+    @bot.on(events.NewMessage(pattern=r"^/kllb(?:@\w+)?(?=\s|$)"))
+    async def on_clone_list(event):
+        """克隆任务列表（分页，每页 5 条）：/kllb 或 /kllb 2 看第 2 页。"""
         if not await _require_admin(event):
             return
-        await menu.render_monitors(event, edit=False)
+        page = _cmd_page(event.raw_text, "kllb")
+        if page is None:
+            await event.reply("用法：`/kllb` 看第 1 页，`/kllb 2` 看第 2 页")
+            return
+        await menu.render_tasks(event, page=page, edit=False)
+
+    @bot.on(events.NewMessage(pattern=r"^/jtlb(?:@\w+)?(?=\s|$)"))
+    async def on_monitor_list(event):
+        """监听任务列表（分页，每页 5 条）：/jtlb 或 /jtlb 2 看第 2 页。"""
+        if not await _require_admin(event):
+            return
+        page = _cmd_page(event.raw_text, "jtlb")
+        if page is None:
+            await event.reply("用法：`/jtlb` 看第 1 页，`/jtlb 2` 看第 2 页")
+            return
+        await menu.render_monitors(event, page=page, edit=False)
 
     @bot.on(events.NewMessage(pattern=r"^/kljx(?:@\w+)?(?=\s|$)"))
     async def on_kl_continue(event):

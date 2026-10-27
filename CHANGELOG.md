@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed（任务列表漏显示 + 分页）
+- **克隆列表漏任务**：`get_tasks_for_list(limit=12)` 是硬截断、标题里的数量用的
+  是"本页条数"而非总数——任务超过 12 个时，多出来的任务永远看不到，数字还显示成 12。
+  改为真总数 + `LIMIT/OFFSET` 分页。
+- **监听列表漏任务**：文本与按钮都只取 `tasks[:10]`，第 11 个起的监听完全不可见；
+  改为分页后全部可见。
+- **两个列表统一分页**：每页 5 条，底部「◀ 上一页 · x/y 页 · 下一页 ▶」，
+  首页/末页自动省略对应按钮，页码越界自动收敛到最后一页（不会出现空白页）；
+  命令侧 `/kllb [页码]`、`/jtlb [页码]` 同步支持。
+- 数据层新增 `count_tasks_for_list` / `count_tasks_by_type`，
+  `get_tasks_for_list` / `get_tasks_by_type` 支持 `offset`。
+
+### Added（克隆完成自动进入监听列表）
+- **去掉 follow 门槛**：`_on_clone_completed` 原来要求克隆任务带 `follow=1` 才
+  转监听，follow=0 的任务跑完就"消失"在克隆列表里；现在克隆完成一律建/恢复
+  对应 monitor 任务并置 `follow=1`（仍可用 `clone.follow_after_finish=false` 全局关闭）。
+- **补齐受限克隆链路**：`RestrictedSyncer` 原来没有完成钩子，`sync_restricted`
+  任务跑完不会转监听；新增 `on_complete` 并接入 `_on_clone_completed`。
+- 测试：新增 `test/test_task_pagination.py`（11 例），全量 267 例通过。
+
 ### Fixed（克隆中途代理失效：90 分钟停机 → 分钟级自愈）
 - **问题**：克隆进行中代理突然失效时，Telethon 内部重连（10×5s）失败后，
   应用层重连固定等 30 分钟（退避公式恒为上限值），且第 3 次失败才重新选优、

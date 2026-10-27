@@ -29,6 +29,17 @@ class RestrictedSyncer(SyncComponentBase):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
                  db: Database, config: dict, userbot_manager=None):
         super().__init__(bot, userbot, db, config, userbot_manager=userbot_manager)
+        # 完成钩子（handlers 注入）：受限克隆跑完同样要转「持续监听」
+        self.on_complete: Callable[[int], Awaitable[None]] | None = None
+
+    async def _fire_complete(self, task_id: int) -> None:
+        """通知外部任务已完成（未注入钩子时什么都不做）。"""
+        if self.on_complete is None:
+            return
+        try:
+            await self.on_complete(task_id)
+        except Exception as e:  # 钩子失败不能影响任务本身的收尾
+            logger.warning("受限任务 #%s 完成后钩子执行失败: %s", task_id, e)
 
     # ------------------------------------------------------------------
     # Takeout 转发核心
@@ -300,6 +311,7 @@ class RestrictedSyncer(SyncComponentBase):
                     f"✅ 扫描完毕，共 {total_scanned} 条消息\n"
                     f"未发现任何受限消息，无需同步"
                 )
+                await self._fire_complete(task_id)
             return
 
         total = len(restricted_ids)
@@ -357,3 +369,4 @@ class RestrictedSyncer(SyncComponentBase):
             f"• Takeout 成功转发: {total_success} 条\n"
             f"• 失败/无媒体: {total_fail} 条"
         )
+        await self._fire_complete(task_id)

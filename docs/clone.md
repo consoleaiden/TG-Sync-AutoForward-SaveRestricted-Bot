@@ -168,7 +168,8 @@
 | `/kljx` 已无新消息 | 回复「已是最新」并保持 `completed`，不会空跑 |
 
 列表排序为 `running → paused → failed → 其它（含 completed）`，
-`get_tasks_for_list(db, CLONE_TASK_TYPES, 20)` 一次取 20 条。
+每页 5 条：菜单底部有「◀ 上一页 / x/y 页 / 下一页 ▶」，
+命令侧用 `/kllb`、`/kllb 2` 翻页；标题显示的是**总任务数**而不是本页条数。
 
 ---
 

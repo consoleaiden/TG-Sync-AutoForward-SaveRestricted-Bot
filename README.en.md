@@ -101,8 +101,8 @@ python main.py
 | `/kljx <link> 120`             | Continue cloning starting at message 120 (get the ID via `/chaid`)                |
 | `/kljx <link> 120-1000`        | Clone only msg 120–1000 (the range may also precede the link)                     |
 | `/jt <link>`                   | Follow new messages only (no history backfill)                                    |
-| `/kllb`                        | Clone task list (includes completed tasks — records are kept forever)             |
-| `/jtlb`                        | Monitor task list (includes follow-ups created from clone tasks)                  |
+| `/kllb`                        | Clone task list (completed kept forever; 5 per page, `/kllb 2` for page 2)         |
+| `/jtlb`                        | Monitor task list (auto-created after a clone finishes; 5 per page, `/jtlb 2`)     |
 | `/klfail`                      | Show tasks with failures; `/klfail 12` lists task #12's failed items and reasons  |
 | `/retryfail <id\|all>`         | Re-send failed items (keeps the resume cursor untouched)                          |
 | `/sd`                          | View clone speed thresholds; `/sd bot fast\|max\|safe`, `/sd ub fast\|safe` presets |

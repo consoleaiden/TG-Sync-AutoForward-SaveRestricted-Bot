@@ -279,15 +279,28 @@ async def find_monitor_task(db: Database, source_chat_id: int,
     return dict(row) if row else None
 
 
-async def get_tasks_by_type(db: Database, task_type: str) -> list[dict]:
-    """按类型取全部任务（含已完成的），用于监控任务总览。"""
-    cursor = await db.db.execute(
-        """SELECT * FROM tasks WHERE type=?
+async def get_tasks_by_type(db: Database, task_type: str,
+                            limit: int | None = None,
+                            offset: int = 0) -> list[dict]:
+    """按类型取任务（含已完成的）；limit/offset 用于分页，limit=None 取全部。"""
+    sql = """SELECT * FROM tasks WHERE type=?
            AND status != 'deleted'
-           ORDER BY (status='running') DESC, id DESC""",
-        (task_type,),
-    )
+           ORDER BY (status='running') DESC, id DESC"""
+    args: list = [task_type]
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        args.extend((max(1, int(limit)), max(0, int(offset))))
+    cursor = await db.db.execute(sql, tuple(args))
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def count_tasks_by_type(db: Database, task_type: str) -> int:
+    """某类型任务总数（不含 deleted），列表分页用。"""
+    cursor = await db.db.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE type=? AND status != 'deleted'",
+        (task_type,))
+    row = await cursor.fetchone()
+    return int(row["n"] if row else 0)
 
 
 async def save_message_map(db: Database, task_id: int,
@@ -382,7 +395,7 @@ async def get_all_active_tasks(db: Database) -> list[dict]:
 
 
 async def get_tasks_for_list(db: Database, types: tuple[str, ...],
-                             limit: int = 20) -> list[dict]:
+                             limit: int = 20, offset: int = 0) -> list[dict]:
     """任务列表用：包含已完成的克隆任务（记录永久保留），运行中的排前面。"""
     if not types:
         return []
@@ -395,10 +408,27 @@ async def get_tasks_for_list(db: Database, types: tuple[str, ...],
                                  WHEN 'failed' THEN 2
                                  ELSE 3 END,
                      id DESC
-            LIMIT ?""",
-        (*types, max(1, int(limit))),
+            LIMIT ? OFFSET ?""",
+        (*types, max(1, int(limit)), max(0, int(offset))),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def count_tasks_for_list(db: Database, types: tuple[str, ...],
+                               statuses: tuple[str, ...] | None = None) -> int:
+    """列表总数（不含 deleted）；statuses 可只统计指定状态，如运行中数量。"""
+    if not types:
+        return 0
+    placeholders = ",".join("?" * len(types))
+    sql = (f"SELECT COUNT(*) AS n FROM tasks "
+           f"WHERE type IN ({placeholders}) AND status != 'deleted'")
+    args: list = list(types)
+    if statuses:
+        sql += f" AND status IN ({','.join('?' * len(statuses))})"
+        args.extend(statuses)
+    cursor = await db.db.execute(sql, tuple(args))
+    row = await cursor.fetchone()
+    return int(row["n"] if row else 0)
 
 
 async def get_interrupted_clones(db: Database) -> list[dict]:

@@ -16,8 +16,13 @@
 
 - **按钮**：`/start` → 「👁 新建持续监听」→ 发源链接 → 选目标 → 选模式 → 确认
 - **命令**：`/jt <链接>`，或旧的 `/monitor <链接> [--forward]`
-- **自动**：克隆任务完成时由 `syncer.on_complete` → `_on_clone_completed` 触发，
-  前提是任务的 `follow=1`（`/kl` 建的任务默认就是 1）
+- **自动**：克隆任务完成时由 `syncer.on_complete` / `restricted_syncer.on_complete`
+  → `_on_clone_completed` 触发。**不看 `follow` 标志**——克隆跑完一律建/恢复监听
+  并置 `follow=1`，所以每个完成的克隆都会出现在监听任务列表里；
+  想整体关掉用 `clone.follow_after_finish: false`。
+
+监听列表每页 5 条，底部「◀ 上一页 / x/y 页 / 下一页 ▶」翻页；
+命令侧 `/jtlb`、`/jtlb 2`。列表标题显示总监听数与运行中数量。
 
 创建成功后会立刻发一条确认消息，包含任务编号、源、目标、模式、监听范围
 （全部新消息 / 仅话题 #N）以及「详情 / 监听任务 / 暂停」按钮。**没有这条消息就说明没建成功**，
