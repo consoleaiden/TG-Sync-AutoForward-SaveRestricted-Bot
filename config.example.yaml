@@ -97,12 +97,22 @@ clone:
   # 克隆跑完后自动转为「持续监听」后续新消息（任务详情里可单独关闭）
   follow_after_finish: true
   # 评论区克隆：帖子克隆完后进入讨论组把评论区内容也克隆到目标频道。
-  # hint = 帖子文本包含 comment_hint 提示词才进（推荐：这类频道把真内容放评论）；
-  # all  = 凡开启评论区的帖子都克隆（克隆量与请求频率显著上升，慎用）；
+  # hint = 帖子文本含 comment_hints 任一关键词才进（默认「评论区」，
+  #        「评论区获取」是它的超集，旧配置无需改）；
+  # all  = 凡开启评论区的帖子都克隆（全量连带，请求频率显著上升，慎用）；
   # off  = 禁用。评论区需 UserBot 能读到讨论组，走统一降级策略链。
   comments_mode: hint
-  comment_hint: "评论区获取" # 提示词，命中即克隆该帖评论区；改空串后等价于 all 判定失败即禁用
-  comment_max: 1000 # 单个帖子评论区克隆上限（防止异常巨大的评论区拖垮任务）
+  comment_hints: ["评论区"] # 任一命中即触发；可写 ["评论区", "看评论区", "评论区自取"]
+  comment_hint: "" # 兼容旧键：comment_hints 缺失且此处非空时生效
+  comment_max: 1000 # 单帖上限，0 = 不限（完整克隆）
+  comment_scan_max: 20000 # comment_max=0 时的硬扫描上限，防异常巨型线程
+  comment_order: asc # asc=按时间正序（默认）/ desc=限条数时保留最新
+  comment_read_from: auto # auto=讨论组优先、频道侧兜底 / group / channel
+  comment_join: auto # auto=仅 hint 命中帖自动进组 / always / never
+  comment_min_replies: 0 # >0 时评论数低于该值的帖子直接跳过
+  comment_dedupe: true # 线程级幂等：已搬过的帖子不再重复搬
+  comment_pause_every: 200 # 每搬 N 条评论停一下（0 = 不停）
+  comment_pause: 1.0 # 停顿时长（秒）
 
 # ── MTProto 代理自动选优（网络无法直连 Telegram 时启用）────────────────
 # 数据来源：telegram-mtproto-proxy-list 项目每小时更新的 top40.json；

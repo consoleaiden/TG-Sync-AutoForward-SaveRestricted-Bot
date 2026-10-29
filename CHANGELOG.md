@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed（评论区克隆：触发条件泛化 + 自动进讨论组 + 完整克隆）
+- **触发词从「评论区获取」放宽到「评论区」**：`clone.comment_hints` 支持多关键词
+  （默认 `["评论区"]`，「评论区获取」是它的超集，旧配置零改动兼容）；匹配前做
+  NFKC + 去零宽字符/空白归一化，「评 论 区」也能命中。新增 `core/comment_trigger.py`。
+- **真正进入讨论组**：新增 `core/discussion.py`，按 `replies.discussion_id` →
+  `messages.getDiscussionMessage`（取组内顶层消息 ID）→ 频道 `linked_chat_id`
+  定位讨论组；`clone.comment_join`（默认 `auto`）决定是否用 UserBot 自动入组，
+  `auto` 只对关键词命中帖生效，`all` 模式不无差别入群。
+- **双通道读取**：组侧优先，读不到自动回落频道侧 `getReplies`；两条都失败单独计
+  「读取失败」，不再静默少搬。
+- **完整克隆**：`comment_max: 0` 表示不限；`comment_order: asc` 按时间正序落地
+  （旧实现是服务端倒序，目标频道读起来是反的）；`comment_pause_every` 控 UserBot 节奏。
+- **幂等**：新增 `comment_threads` / `comment_map` 两张表，续跑或 `/kljx` 重跑同一条
+  帖子不会重复搬评论。
+
+### Fixed（评论区）
+- **失败标记被计成成功**：`forward_message` 全策略失败会发 `#fail2forward` 并返回
+  消息 ID，评论区据此误判为「克隆成功」、目标频道还会多出占位消息。新增
+  `with_fail_marker=False`，评论失败不再灌标记也不再计入成功。
+- **无主评论**：帖子本身转发失败时不再搬它的评论区。
+- **看门狗误报**：长评论区搬运期间持续喂心跳，不再触发「10 分钟无进展」告警。
+
 ### Fixed（任务列表漏显示 + 分页）
 - **克隆列表漏任务**：`get_tasks_for_list(limit=12)` 是硬截断、标题里的数量用的
   是"本页条数"而非总数——任务超过 12 个时，多出来的任务永远看不到，数字还显示成 12。

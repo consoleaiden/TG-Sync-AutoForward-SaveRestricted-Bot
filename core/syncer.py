@@ -29,6 +29,8 @@ from core.clone_plan import (
     progress_bar,
     split_album_tail,
 )
+from core.comment_trigger import parse_hints, should_clone_comments
+from core.discussion import ensure_member, resolve_discussion
 from core.message_logic import (
     build_forward_units,
     detect_hard_restriction,
@@ -79,13 +81,29 @@ class Syncer(ForwardingComponent):
         # 看门狗：多久没有任何进展就向用户告警一次（0 = 关闭）
         self.stall_seconds = max(0, int(
             clone_cfg.get("stall_alert_seconds", DEFAULT_STALL_SECONDS)))
-        # 评论区克隆：hint=帖子文本含提示词才进评论区；all=凡开评论区的帖子都进；
-        # off=禁用。all 模式克隆量与 UserBot 请求频率会显著上升，默认 hint。
+        # 评论区克隆：hint=帖子文本含触发词才进评论区；all=凡开评论区的帖子都进；
+        # off=禁用。触发词默认「评论区」（「评论区获取」是它的超集，旧配置自动兼容）。
         self.comments_mode = str(clone_cfg.get("comments_mode") or "hint").lower()
         if self.comments_mode not in ("hint", "all", "off"):
             self.comments_mode = "hint"
-        self.comment_hint = str(clone_cfg.get("comment_hint") or "评论区获取")
-        self.comment_max = max(1, int(clone_cfg.get("comment_max") or 1000))
+        self.comment_hints = parse_hints(
+            clone_cfg.get("comment_hints"), clone_cfg.get("comment_hint"))
+        # 0 = 不限（完整克隆），另有 scan_max 兜底防异常巨型线程
+        self.comment_max = max(0, int(clone_cfg.get("comment_max", 1000) or 0))
+        self.comment_scan_max = max(100, int(
+            clone_cfg.get("comment_scan_max") or 20000))
+        self.comment_order = str(clone_cfg.get("comment_order") or "asc").lower()
+        self.comment_read_from = str(
+            clone_cfg.get("comment_read_from") or "auto").lower()
+        self.comment_join = str(clone_cfg.get("comment_join") or "auto").lower()
+        self.comment_min_replies = max(0, int(
+            clone_cfg.get("comment_min_replies") or 0))
+        self.comment_dedupe = bool(clone_cfg.get("comment_dedupe", True))
+        self.comment_pause_every = max(0, int(
+            clone_cfg.get("comment_pause_every") or 0))
+        self.comment_pause = max(0.0, float(clone_cfg.get("comment_pause") or 1.0))
+        self._disc_cache: dict[int, int] = {}   # 源频道 → 讨论组 ID
+        self._disc_member: set[int] = set()      # 已确认 UserBot 可读的讨论组
 
     # ------------------------------------------------------------------
     # 起点解析
@@ -380,64 +398,128 @@ class Syncer(ForwardingComponent):
     async def _clone_post_comments(self, task_id: int, post, source_chat_id: int,
                                    target_chat_id: int, mode: str,
                                    target_topic_id: int | None,
-                                   userbot: TelegramClient | None
-                                   ) -> tuple[int, int]:
-        """克隆一条频道帖子的全部评论区消息；返回 (成功条数, 失败条数)。
+                                   userbot: TelegramClient | None, *,
+                                   tick=None) -> tuple[int, int, bool]:
+        """克隆一条帖子的整条评论区；返回 (成功, 转发失败, 是否读取失败)。
 
-        触发条件由 comments_mode 决定：
-        - hint：帖子文本包含 comment_hint 提示词（默认「评论区获取」）
-        - all：凡开启评论区的帖子都克隆（克隆量与请求频率会显著上升）
-        评论区需要用户号读取（Bot 通常进不了讨论组），走统一降级策略链转发。
+        触发判定见 core.comment_trigger.should_clone_comments：
+        - hint（默认）：正文含 comment_hints 任一关键词（默认「评论区」）
+        - all ：凡开启评论区的帖子都搬（全量连带）
+        - off ：禁用
+        读取优先走讨论组（必要时自动入组），失败回落频道侧 getReplies。
         """
         if self.comments_mode == "off" or userbot is None:
-            return 0, 0
-        if self.comments_mode == "hint":
-            text = (getattr(post, "text", None) or getattr(post, "message", "") or "")
-            if self.comment_hint not in text:
-                return 0, 0
+            return 0, 0, False
 
-        replies = getattr(post, "replies", None)
-        if not replies or not getattr(replies, "comments", False):
-            logger.info("帖子 %s 命中评论区策略，但该帖未开启评论区", post.id)
-            return 0, 0
+        hit, reason = should_clone_comments(
+            post, mode=self.comments_mode, hints=self.comment_hints,
+            min_replies=self.comment_min_replies)
+        if not hit:
+            logger.debug("帖子 %s 不搬评论区（%s）",
+                         getattr(post, "id", "?"), reason)
+            return 0, 0, False
 
-        # 评论区消息位于讨论组；优先用 replies.discussion_id 定位
-        disc_id = 0
-        did = getattr(replies, "discussion_id", None)
-        if did:
-            try:
-                from telethon import utils as tl_utils
-                from telethon.tl.types import PeerChannel
-                disc_id = tl_utils.get_peer_id(PeerChannel(int(did)))
-            except Exception:
-                disc_id = 0
+        if self.comment_dedupe and await models.is_comment_thread_done(
+                self.db, task_id, post.id):
+            logger.info("帖子 %s 评论区此前已克隆，跳过（幂等）", post.id)
+            return 0, 0, False
+
+        disc_id, top_id = await resolve_discussion(
+            userbot, source_chat_id, post, self._disc_cache)
+
+        # 只有 hint 命中才自动入组：all 模式无差别入群，风控代价太高
+        join = self.comment_join == "always" or (
+            self.comment_join == "auto" and reason.startswith("hint"))
+        readable = await ensure_member(
+            userbot, disc_id, self._disc_member, join=join)
+
+        # auto：组侧优先（私有组也读得到），频道侧兜底（零额外 RPC）
+        attempts: list[tuple[int, int, str]] = []
+        if readable and top_id and self.comment_read_from in ("auto", "group"):
+            attempts.append((disc_id, top_id, "group"))
+        if self.comment_read_from in ("auto", "channel") or not attempts:
+            attempts.append((source_chat_id, post.id, "channel"))
 
         ok = fail = 0
+        read_failed = False
+        used = "-"
+        for chat_for, thread_id, where in attempts:
+            ok, fail, err = await self._drain_comment_thread(
+                task_id, post, chat_for, thread_id, target_chat_id,
+                mode, target_topic_id, userbot, where=where, tick=tick)
+            if err:
+                read_failed = True
+                continue                    # 该通道读不到 → 换另一条通道再试
+            used = where
+            break
+
+        logger.info("帖子 %s 评论区: 触发(%s) 通道=%s 成功=%d 失败=%d 读失败=%s",
+                    post.id, reason, used, ok, fail, read_failed)
+        if self.comment_dedupe and (ok or fail):
+            await models.mark_comment_thread(
+                self.db, task_id, post.id, disc_id,
+                ok=ok, fail=fail, done=not fail)
+        return ok, fail, read_failed
+
+    async def _drain_comment_thread(self, task_id: int, post, chat_id: int,
+                                    thread_id: int, target_chat_id: int,
+                                    mode: str, target_topic_id: int | None,
+                                    userbot: TelegramClient, *, where: str,
+                                    tick=None) -> tuple[int, int, bool]:
+        """翻完一条评论线程并逐条转发，返回 (成功, 失败, 读取是否异常)。"""
+        cap = self.comment_max or 0
+        scan_cap = cap or self.comment_scan_max
+        collected: list = []
         try:
-            async for c in userbot.iter_messages(source_chat_id, reply_to=post.id):
-                if self._cancel_flags.get(task_id) or ok + fail >= self.comment_max:
+            async for c in userbot.iter_messages(chat_id, reply_to=thread_id):
+                if self._cancel_flags.get(task_id) or len(collected) >= scan_cap:
                     break
                 if isinstance(c, MessageService):
                     continue
                 if not getattr(c, "text", None) \
                         and getattr(c, "media", None) is None:
                     continue
-                chat_for = disc_id or int(getattr(c, "chat_id", 0) or 0) \
-                    or source_chat_id
-                try:
-                    target_id = await self.forwarder.forward_message(
-                        chat_for, c.id, target_chat_id, mode, target_topic_id,
-                        caller="syncer", userbot=userbot)
-                except Exception as e:
-                    logger.warning("评论 %s/%s 克隆失败: %s", chat_for, c.id, e)
-                    target_id = None
-                if target_id:
-                    ok += 1
-                else:
-                    fail += 1
+                collected.append(c)
         except Exception as e:
-            logger.warning("读取帖子 %s 评论区失败: %s", post.id, e)
-        return ok, fail
+            logger.warning("读取帖子 %s 评论区失败（%s, chat=%s）: %s: %s",
+                           post.id, where, chat_id, type(e).__name__, e)
+            return 0, 0, True
+
+        if not collected:
+            return 0, 0, False
+
+        # 服务端按 id 倒序返回；正序搬，目标频道读起来才是对话顺序
+        if self.comment_order == "asc":
+            collected.reverse()
+        if cap:
+            # asc 时保留最早 cap 条，desc 时保留最新 cap 条
+            collected = collected[:cap]
+
+        ok = fail = 0
+        for idx, c in enumerate(collected, 1):
+            if self._cancel_flags.get(task_id):
+                break
+            chat_for = int(getattr(c, "chat_id", 0) or 0) or chat_id
+            try:
+                target_id = await self.forwarder.forward_message(
+                    chat_for, c.id, target_chat_id, mode, target_topic_id,
+                    caller="syncer-comment", userbot=userbot,
+                    with_fail_marker=False)   # 评论失败不往目标灌 #fail2forward
+            except Exception as e:
+                logger.warning("评论 %s/%s 克隆失败: %s", chat_for, c.id, e)
+                target_id = None
+            if target_id:
+                ok += 1
+                if self.comment_dedupe:
+                    await models.save_comment_map(
+                        self.db, task_id, post.id, c.id, target_id)
+            else:
+                fail += 1
+            if tick is not None:
+                tick()                          # 喂看门狗心跳，长评论区不误报
+            if self.comment_pause_every and idx % self.comment_pause_every == 0:
+                await asyncio.sleep(self.comment_pause)
+        return ok, fail, False
 
     async def _record_failure(self, task_id: int, source_msg_id: int,
                               reason: str) -> None:
@@ -598,6 +680,7 @@ class Syncer(ForwardingComponent):
         last_progress_at = 0
         restricted_success = restricted_fail = 0
         comments_done = comments_fail = comments_posts = 0
+        comments_read_fail = 0
         takeout = None
         flood_retries = 0
         # 跨批次/跨 FloodWait 重试保留，确保跳过的计数不丢
@@ -610,6 +693,13 @@ class Syncer(ForwardingComponent):
             speed = (done - plan.done_before) / elapsed if elapsed > 0 else 0
             processed = done + failed + skipped
             eta = ((plan.total - processed) / speed) if (plan.total and speed > 0) else None
+            comment_line = ""
+            if comments_posts or comments_read_fail:
+                comment_line = (
+                    f"评论区: {comments_posts} 帖 / {comments_done:,} 条"
+                    + (f" · 读取失败 {comments_read_fail} 帖"
+                       if comments_read_fail else "")
+                    + "\n")
             return (
                 f"📥 克隆任务 #{task_id}\n"
                 f"📌 源: {src_label}\n"
@@ -617,6 +707,7 @@ class Syncer(ForwardingComponent):
                 f"进度: {progress_bar(processed, plan.total)}\n"
                 f"游标: msg_id={cursor} · 速率 {speed:.1f} 条/秒\n"
                 f"成功 {done - plan.done_before:,} · 失败 {failed:,} · 跳过 {skipped:,}\n"
+                f"{comment_line}"
                 f"已用 {format_duration(elapsed)} · 剩余约 {format_duration(eta)}"
             )
 
@@ -726,22 +817,26 @@ class Syncer(ForwardingComponent):
                                 self._log_forward_result(
                                     logger, "clone", task_id, kind, source_ids, target_ids)
 
-                            # 评论区克隆：本条转发结束后，若命中评论区策略
-                            # （提示词或 all 模式），把评论区内容全部克隆到目标
-                            # 频道，再继续下一条（评论不计入覆盖率分母，单独汇报）
-                            if self.comments_mode != "off":
+                            # 评论区克隆：帖子本身落地后才搬它的评论区，避免目标
+                            # 里出现「无主评论」；评论不计入覆盖率分母，单独汇报。
+                            if self.comments_mode != "off" \
+                                    and (target_ids or dup_count):
                                 for sid in source_ids:
                                     post = msg_by_id.get(sid)
                                     if post is None:
                                         continue
-                                    c_ok, c_fail = await self._clone_post_comments(
+                                    c_ok, c_fail, c_err = await self._clone_post_comments(
                                         task_id, post, source_chat_id,
                                         target_chat_id, mode, target_topic_id,
-                                        active_userbot)
+                                        active_userbot,
+                                        tick=lambda: state.update(
+                                            beat=time.monotonic()))
                                     if c_ok or c_fail:
                                         comments_done += c_ok
                                         comments_fail += c_fail
                                         comments_posts += 1
+                                    if c_err:
+                                        comments_read_fail += 1
 
                             state["beat"] = time.monotonic()
 
@@ -815,11 +910,13 @@ class Syncer(ForwardingComponent):
         if restricted_fail:
             restricted_line += f"，失败 {restricted_fail:,} 条"
         comment_line = ""
-        if comments_posts:
+        if comments_posts or comments_read_fail:
             comment_line = (f"\n• 评论区: {comments_posts} 个帖子克隆了 "
                             f"{comments_done:,} 条评论")
             if comments_fail:
                 comment_line += f"，失败 {comments_fail} 条"
+            if comments_read_fail:
+                comment_line += f"，读取失败 {comments_read_fail} 帖"
         summary = self.forwarder.strategy_summary() if hasattr(self.forwarder, "strategy_summary") else ""
         strategy_line = f"\n• 策略分布: {summary}" if summary else ""
         diag = (self.forwarder.diagnostics_summary()

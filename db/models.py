@@ -338,6 +338,63 @@ async def count_message_map(db: Database, task_id: int) -> int:
     return int(row["n"]) if row else 0
 
 
+# ── 评论区克隆台账 ────────────────────────────────────────────────────────
+
+async def is_comment_thread_done(db: Database, task_id: int, post_id: int) -> bool:
+    """该帖评论区是否已完整搬过（幂等判定）。"""
+    cursor = await db.db.execute(
+        "SELECT finished FROM comment_threads WHERE task_id=? AND source_post_id=?",
+        (task_id, int(post_id)))
+    row = await cursor.fetchone()
+    return bool(row and int(row["finished"]))
+
+
+async def mark_comment_thread(db: Database, task_id: int, post_id: int,
+                              disc_id: int = 0, *, ok: int = 0, fail: int = 0,
+                              done: bool = False) -> None:
+    """记录/累加一条评论线程的搬运结果；done=True 表示下次可直接跳过。"""
+    await db.db.execute(
+        """INSERT INTO comment_threads
+             (task_id, source_post_id, disc_id, ok_count, fail_count, finished)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(task_id, source_post_id) DO UPDATE SET
+             disc_id=excluded.disc_id,
+             ok_count=ok_count+excluded.ok_count,
+             fail_count=fail_count+excluded.fail_count,
+             finished=MAX(finished, excluded.finished),
+             updated_at=CURRENT_TIMESTAMP""",
+        (task_id, int(post_id), int(disc_id or 0), int(ok), int(fail),
+         1 if done else 0))
+    await db.db.commit()
+
+
+async def save_comment_map(db: Database, task_id: int, post_id: int,
+                           comment_id: int, target_msg_id: int) -> None:
+    """记录「评论 → 目标消息」映射（INSERT OR IGNORE，重复投递不产生第二行）。"""
+    await db.db.execute(
+        "INSERT OR IGNORE INTO comment_map"
+        " (task_id, source_post_id, source_comment_id, target_msg_id)"
+        " VALUES (?,?,?,?)",
+        (task_id, int(post_id), int(comment_id), int(target_msg_id)))
+    await db.db.commit()
+
+
+async def count_comment_map(db: Database, task_id: int) -> int:
+    """该任务已落地的评论条数（续跑后汇报用，不依赖内存计数）。"""
+    cursor = await db.db.execute(
+        "SELECT COUNT(*) AS n FROM comment_map WHERE task_id=?", (task_id,))
+    row = await cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
+async def count_comment_threads(db: Database, task_id: int) -> int:
+    """该任务已搬过评论区的帖子数。"""
+    cursor = await db.db.execute(
+        "SELECT COUNT(*) AS n FROM comment_threads WHERE task_id=?", (task_id,))
+    row = await cursor.fetchone()
+    return int(row["n"]) if row else 0
+
+
 async def add_failed_message(db: Database, task_id: int, source_msg_id: int,
                              reason: str = "") -> None:
     """登记一条转发失败的消息（供 /klfail 查看、/retryfail 重试）。"""

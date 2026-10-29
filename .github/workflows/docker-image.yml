@@ -1,14 +1,18 @@
 name: Build Docker Image
 
 # 每次推送代码到 main 自动构建并发布镜像；打 v* 标签时额外生成版本 tag
+# 注意：这里刻意不写 paths-ignore —— 任何一次更新（含文档 / 配置）都应产出新的
+# 镜像，否则「改完文档想让群晖拉到最新镜像」会静默失败。
 on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
   workflow_dispatch: {}
+
+# 连续推送时取消上一次未完成的构建，避免旧提交占着 runner 排队
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io

@@ -386,10 +386,14 @@ class Forwarder:
                               target_chat_id: int, mode: str = "copy",
                               target_topic_id: int | None = None,
                               caller: str = "monitor",
-                              userbot: TelegramClient | None = None) -> int | None:
+                              userbot: TelegramClient | None = None,
+                              with_fail_marker: bool = True) -> int | None:
         """
         转发单条消息，返回目标消息 ID。失败返回 None。
         降级链：Bot直接 → UserBot转发 → UserBot读+Bot写 → UserBot下载+Bot上传 → 发失败标记
+
+        with_fail_marker=False 时不发 #fail2forward 标记：评论这类"附带内容"
+        失败一条不该往目标频道灌一条占位消息，也避免调用方把标记的 ID 误判成成功。
         """
         result = await self._run_message_strategies(
             source_chat_id, msg_id, target_chat_id, mode, target_topic_id,
@@ -398,10 +402,13 @@ class Forwarder:
         if result is not None:
             return result
 
-        # 策略4: 发送失败标记（私聊环境跳过，避免向用户推送垃圾标记）
+        # 策略4: 发送失败标记（私聊环境/评论等附带内容跳过）
         is_private = (caller == "private") or (target_chat_id > 0)
         if is_private:
             logger.warning("msg=%s 所有策略失败，私聊环境跳过发送 #fail2forward 标记", msg_id)
+            return None
+        if not with_fail_marker:
+            logger.warning("msg=%s 所有策略失败，按调用方要求跳过 #fail2forward 标记", msg_id)
             return None
 
         logger.warning("msg=%s 所有策略失败，发送 #fail2forward 标记", msg_id)

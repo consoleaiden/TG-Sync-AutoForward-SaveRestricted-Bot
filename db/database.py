@@ -128,6 +128,31 @@ class Database:
                 value TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            -- 评论区线程级台账：一条帖子一行，用于「搬过就不再搬」的幂等判定
+            CREATE TABLE IF NOT EXISTS comment_threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id),
+                source_post_id INTEGER NOT NULL,
+                disc_id INTEGER DEFAULT 0,
+                ok_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                finished INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(task_id, source_post_id)
+            );
+            -- 评论级映射：与 message_map 分开存（评论 id 与帖子 id 会撞号）
+            CREATE TABLE IF NOT EXISTS comment_map (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id),
+                source_post_id INTEGER NOT NULL,
+                source_comment_id INTEGER NOT NULL,
+                target_msg_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(task_id, source_post_id, source_comment_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_comment_map_task
+                ON comment_map(task_id, source_post_id);
         """)
         await self._migrate()
         await self._ensure_message_map_unique()
